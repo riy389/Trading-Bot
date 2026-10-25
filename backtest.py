@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Backtest engine sederhana: Trend-Following (EMA cross) vs Mean-Reversion (RSI)
-Data asli dari Bitget via CCXT. Long-only, fee Bitget nyata, tanpa leverage.
+Data asli dari Bitget via CCXT. Fee Bitget nyata, tanpa leverage.
 
 Cara pakai:
     pip install ccxt pandas numpy --break-system-packages
@@ -9,10 +9,13 @@ Cara pakai:
 
 Edit PAIRS / TIMEFRAMES / DAYS_BACK di bawah untuk ubah cakupan uji.
 
-Asumsi eksekusi (hasil audit 26 Okt 2026):
-- Sinyal dihitung dari close candle i, entry di OPEN candle i+1 (bukan close i).
-- Stop-loss dicek mulai candle entry. Kalau open gap di bawah SL, fill di open
-  (lebih buruk dari harga SL), bukan di harga SL.
+Asumsi eksekusi:
+- Sinyal dihitung dari close candle i. SEMUA aksi (entry, exit sinyal, reversal)
+  dieksekusi di OPEN candle i+1, bukan di close candle sinyal.
+- Stop-loss dicek mulai candle entry (low untuk long, high untuk short). Kalau
+  open gap melewati SL, fill di open (lebih buruk dari harga SL).
+- Dua mode: long_only dan long_short (short saat sinyal berlawanan).
+  Funding rate perpetual TIDAK dimodelkan.
 - Hasil dilaporkan 3 periode: full, IS (paruh pertama), OOS (paruh kedua).
   Trade dimasukkan ke IS/OOS berdasarkan waktu entry.
 """
@@ -35,11 +38,14 @@ SLIPPAGE = 0.0005             # 0.05% asumsi slippage per sisi, konservatif
 # Parameter strategi
 EMA_FAST, EMA_SLOW = 21, 55
 RSI_PERIOD = 14
-RSI_OVERSOLD, RSI_EXIT = 30, 50
+RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_EXIT = 30, 70, 50
 
 # Stop-loss: beberapa level diuji sekaligus (persentase dari harga entry).
 # None berarti tanpa SL (baseline lama, untuk perbandingan).
 SL_LEVELS = [None, 0.01, 0.02, 0.03, 0.05]
+
+# Mode arah: nama -> boleh short?
+MODES = {"long_only": False, "long_short": True}
 
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
@@ -115,116 +121,125 @@ def add_indicators(df):
     return df
 
 
-def run_trend_following(df, sl_pct=None):
-    """Long-only EMA cross: sinyal cross up di close candle i -> entry di open
-    candle i+1. Keluar saat fast cross down slow (di close) ATAU saat low candle
-    menyentuh stop-loss, mana dulu terjadi (SL diprioritaskan). Kalau open gap
-    di bawah SL, fill di open. sl_pct=None berarti tanpa stop-loss."""
+def _open_position(side, ts, open_, sl_pct):
+    """Buka posisi di open candle. Slippage selalu merugikan."""
+    if side == "long":
+        entry_price = open_ * (1 + SLIPPAGE)
+        sl_price = entry_price * (1 - sl_pct) if sl_pct else None
+    else:
+        entry_price = open_ * (1 - SLIPPAGE)
+        sl_price = entry_price * (1 + sl_pct) if sl_pct else None
+    return {"side": side, "entry_ts": ts, "entry_price": entry_price, "sl_price": sl_price}
+
+
+def _sl_fill(position, open_, high, low):
+    """Harga fill mentah (sebelum slippage) kalau SL tersentuh, selain itu None.
+    Kalau open gap melewati SL, fill di open (lebih buruk dari harga SL)."""
+    sl = position["sl_price"]
+    if sl is None:
+        return None
+    if position["side"] == "long":
+        return min(open_, sl) if low <= sl else None
+    return max(open_, sl) if high >= sl else None
+
+
+def _close_position(position, ts, raw_exit_price, reason):
+    if position["side"] == "long":
+        exit_price = raw_exit_price * (1 - SLIPPAGE)
+        gross = (exit_price - position["entry_price"]) / position["entry_price"]
+    else:
+        exit_price = raw_exit_price * (1 + SLIPPAGE)
+        gross = (position["entry_price"] - exit_price) / position["entry_price"]
+    return {
+        "side": position["side"],
+        "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
+        "entry_price": position["entry_price"], "exit_price": exit_price,
+        "pnl_pct": gross - ROUND_TRIP_FEE, "exit_reason": reason,
+    }
+
+
+def _simulate(df, sl_pct, allow_short, get_signal):
+    """Loop eksekusi bersama untuk semua strategi.
+    get_signal(i, position) dipanggil di close candle i dan mengembalikan target
+    untuk dieksekusi di open candle i+1: "long", "short", "flat", atau None.
+    "short" saat allow_short=False hanya menutup long (tidak membuka short)."""
+    opens = df["open"].to_numpy()
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+    tss = df["ts"].tolist()
+
     trades = []
     position = None
-    pending_entry = False
+    pending = None
     for i in range(1, len(df)):
-        prev_fast, prev_slow = df["ema_fast"].iloc[i - 1], df["ema_slow"].iloc[i - 1]
-        cur_fast, cur_slow = df["ema_fast"].iloc[i], df["ema_slow"].iloc[i]
-        open_ = df["open"].iloc[i]
-        price = df["close"].iloc[i]
-        low = df["low"].iloc[i]
-        ts = df["ts"].iloc[i]
+        # 1) Eksekusi sinyal dari candle sebelumnya di open candle ini
+        if pending is not None:
+            if position is not None and position["side"] != pending:
+                trades.append(_close_position(position, tss[i], opens[i], "signal"))
+                position = None
+            if position is None and (pending == "long" or (pending == "short" and allow_short)):
+                position = _open_position(pending, tss[i], opens[i], sl_pct)
+            pending = None
 
-        cross_up = prev_fast <= prev_slow and cur_fast > cur_slow
-        cross_down = prev_fast >= prev_slow and cur_fast < cur_slow
-
-        # Eksekusi sinyal candle sebelumnya: entry di open candle ini
-        if position is None and pending_entry:
-            entry_price = open_ * (1 + SLIPPAGE)
-            sl_price = entry_price * (1 - sl_pct) if sl_pct else None
-            position = {"entry_ts": ts, "entry_price": entry_price, "sl_price": sl_price}
-        pending_entry = False
-
+        # 2) Cek stop-loss dalam candle ini (termasuk candle entry)
         if position is not None:
-            # Cek stop-loss dulu (pakai low candle) sebelum cek sinyal exit normal
-            if position["sl_price"] is not None and low <= position["sl_price"]:
-                exit_price = min(open_, position["sl_price"]) * (1 - SLIPPAGE)
-                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE
-                trades.append({
-                    "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
-                    "entry_price": position["entry_price"], "exit_price": exit_price,
-                    "pnl_pct": pnl_pct, "exit_reason": "stop_loss",
-                })
-                position = None
-            elif cross_down:
-                exit_price = price * (1 - SLIPPAGE)
-                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE
-                trades.append({
-                    "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
-                    "entry_price": position["entry_price"], "exit_price": exit_price,
-                    "pnl_pct": pnl_pct, "exit_reason": "signal",
-                })
+            fill = _sl_fill(position, opens[i], highs[i], lows[i])
+            if fill is not None:
+                trades.append(_close_position(position, tss[i], fill, "stop_loss"))
                 position = None
 
-        if position is None and cross_up:
-            pending_entry = True
+        # 3) Sinyal baru dari close candle ini
+        pending = get_signal(i, position)
     return trades
 
 
-def run_mean_reversion(df, sl_pct=None):
-    """Long-only RSI: sinyal RSI < 30 di close candle i -> entry di open candle
-    i+1. Keluar saat RSI > 50 (di close) ATAU saat low candle menyentuh
-    stop-loss, mana dulu terjadi. Kalau open gap di bawah SL, fill di open.
-    sl_pct=None berarti tanpa stop-loss."""
-    trades = []
-    position = None
-    pending_entry = False
-    for i in range(1, len(df)):
-        rsi = df["rsi"].iloc[i]
-        prev_rsi = df["rsi"].iloc[i - 1]
-        open_ = df["open"].iloc[i]
-        price = df["close"].iloc[i]
-        low = df["low"].iloc[i]
-        ts = df["ts"].iloc[i]
+def run_trend_following(df, sl_pct=None, allow_short=False):
+    """EMA cross: fast cross up slow -> long, cross down -> short (atau hanya
+    tutup long kalau allow_short=False). Selalu reversal saat sinyal berlawanan."""
+    fast = df["ema_fast"].to_numpy()
+    slow = df["ema_slow"].to_numpy()
 
-        if pd.isna(rsi) or pd.isna(prev_rsi):
-            continue
+    def get_signal(i, position):
+        if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
+            return "long"
+        if fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
+            return "short"
+        return None
 
-        enter_signal = prev_rsi >= RSI_OVERSOLD and rsi < RSI_OVERSOLD
-        exit_signal = prev_rsi <= RSI_EXIT and rsi > RSI_EXIT
-
-        if position is None and pending_entry:
-            entry_price = open_ * (1 + SLIPPAGE)
-            sl_price = entry_price * (1 - sl_pct) if sl_pct else None
-            position = {"entry_ts": ts, "entry_price": entry_price, "sl_price": sl_price}
-        pending_entry = False
-
-        if position is not None:
-            if position["sl_price"] is not None and low <= position["sl_price"]:
-                exit_price = min(open_, position["sl_price"]) * (1 - SLIPPAGE)
-                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE
-                trades.append({
-                    "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
-                    "entry_price": position["entry_price"], "exit_price": exit_price,
-                    "pnl_pct": pnl_pct, "exit_reason": "stop_loss",
-                })
-                position = None
-            elif exit_signal:
-                exit_price = price * (1 - SLIPPAGE)
-                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE
-                trades.append({
-                    "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
-                    "entry_price": position["entry_price"], "exit_price": exit_price,
-                    "pnl_pct": pnl_pct, "exit_reason": "signal",
-                })
-                position = None
-
-        if position is None and enter_signal:
-            pending_entry = True
-    return trades
+    return _simulate(df, sl_pct, allow_short, get_signal)
 
 
-def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="full"):
+def run_mean_reversion(df, sl_pct=None, allow_short=False):
+    """RSI: cross di bawah 30 -> long, keluar saat cross di atas 50.
+    Kalau allow_short: cross di atas 70 -> short, keluar saat cross di bawah 50."""
+    rsi = df["rsi"].to_numpy()
+
+    def get_signal(i, position):
+        r, p = rsi[i], rsi[i - 1]
+        if np.isnan(r) or np.isnan(p):
+            return None
+        side = position["side"] if position is not None else None
+        if side == "long" and p <= RSI_EXIT < r:
+            return "flat"
+        if side == "short" and p >= RSI_EXIT > r:
+            return "flat"
+        if p >= RSI_OVERSOLD and r < RSI_OVERSOLD:
+            return "long"
+        if p <= RSI_OVERBOUGHT and r > RSI_OVERBOUGHT:
+            return "short"
+        return None
+
+    return _simulate(df, sl_pct, allow_short, get_signal)
+
+
+def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="full", mode="long_only"):
+    base = {
+        "strategy": strategy_name, "symbol": symbol, "timeframe": timeframe,
+        "mode": mode, "stop_loss": sl_label, "period": period,
+    }
     if not trades:
         return {
-            "strategy": strategy_name, "symbol": symbol, "timeframe": timeframe,
-            "stop_loss": sl_label, "period": period,
+            **base,
             "n_trades": 0, "total_return_pct": 0, "win_rate_pct": 0,
             "profit_factor": None, "max_drawdown_pct": 0, "avg_pnl_pct": 0,
             "sl_hit_rate_pct": 0,
@@ -255,8 +270,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="
     sl_hit_rate = sl_hits / n * 100
 
     return {
-        "strategy": strategy_name, "symbol": symbol, "timeframe": timeframe,
-        "stop_loss": sl_label, "period": period,
+        **base,
         "n_trades": n, "total_return_pct": round(total_return, 2),
         "win_rate_pct": round(win_rate, 1),
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else "inf",
@@ -297,27 +311,28 @@ def main():
             for sl in SL_LEVELS:
                 sl_label = "none" if sl is None else f"{int(sl * 100)}%"
 
-                tf_trades = run_trend_following(df, sl_pct=sl)
-                mr_trades = run_mean_reversion(df, sl_pct=sl)
+                for mode, allow_short in MODES.items():
+                    tf_trades = run_trend_following(df, sl_pct=sl, allow_short=allow_short)
+                    mr_trades = run_mean_reversion(df, sl_pct=sl, allow_short=allow_short)
 
-                for period, trades in split_by_period(tf_trades, split_ts).items():
-                    all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, period))
-                for period, trades in split_by_period(mr_trades, split_ts).items():
-                    all_results.append(compute_metrics(trades, "MeanReversion_RSI14", symbol, tf, sl_label, period))
+                    for period, trades in split_by_period(tf_trades, split_ts).items():
+                        all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, period, mode))
+                    for period, trades in split_by_period(mr_trades, split_ts).items():
+                        all_results.append(compute_metrics(trades, "MeanReversion_RSI14", symbol, tf, sl_label, period, mode))
 
-                raw_trades[f"{symbol}_{tf}_trend_sl{sl_label}"] = tf_trades
-                raw_trades[f"{symbol}_{tf}_meanrev_sl{sl_label}"] = mr_trades
+                    raw_trades[f"{symbol}_{tf}_trend_sl{sl_label}_{mode}"] = tf_trades
+                    raw_trades[f"{symbol}_{tf}_meanrev_sl{sl_label}_{mode}"] = mr_trades
 
     # simpan hasil
     with open(OUTPUT_JSON, "w") as f:
         json.dump({"summary": all_results, "trades": raw_trades}, f, indent=2, default=str)
 
     df_summary = pd.DataFrame(all_results)
-    df_summary = df_summary.sort_values(["timeframe", "strategy", "stop_loss", "symbol", "period"])
+    df_summary = df_summary.sort_values(["timeframe", "strategy", "mode", "stop_loss", "symbol", "period"])
     df_summary.to_csv(OUTPUT_CSV, index=False)
 
     print("\n" + "=" * 100)
-    print("RINGKASAN HASIL (per timeframe, strategi, SL, pair, periode full/IS/OOS)")
+    print("RINGKASAN HASIL (per timeframe, strategi, mode, SL, pair, periode full/IS/OOS)")
     print("=" * 100)
     print(df_summary.to_string(index=False))
     print(f"\nDisimpan ke: {OUTPUT_CSV} dan {OUTPUT_JSON}")
