@@ -8,6 +8,13 @@ Cara pakai:
     python3 backtest.py
 
 Edit PAIRS / TIMEFRAMES / DAYS_BACK di bawah untuk ubah cakupan uji.
+
+Asumsi eksekusi (hasil audit 26 Okt 2026):
+- Sinyal dihitung dari close candle i, entry di OPEN candle i+1 (bukan close i).
+- Stop-loss dicek mulai candle entry. Kalau open gap di bawah SL, fill di open
+  (lebih buruk dari harga SL), bukan di harga SL.
+- Hasil dilaporkan 3 periode: full, IS (paruh pertama), OOS (paruh kedua).
+  Trade dimasukkan ke IS/OOS berdasarkan waktu entry.
 """
 
 import ccxt
@@ -109,14 +116,17 @@ def add_indicators(df):
 
 
 def run_trend_following(df, sl_pct=None):
-    """Long-only EMA cross: masuk saat fast cross up slow, keluar saat fast cross
-    down slow ATAU saat harga low candle menyentuh stop-loss, mana dulu terjadi.
-    sl_pct=None berarti tanpa stop-loss (perilaku lama)."""
+    """Long-only EMA cross: sinyal cross up di close candle i -> entry di open
+    candle i+1. Keluar saat fast cross down slow (di close) ATAU saat low candle
+    menyentuh stop-loss, mana dulu terjadi (SL diprioritaskan). Kalau open gap
+    di bawah SL, fill di open. sl_pct=None berarti tanpa stop-loss."""
     trades = []
     position = None
+    pending_entry = False
     for i in range(1, len(df)):
         prev_fast, prev_slow = df["ema_fast"].iloc[i - 1], df["ema_slow"].iloc[i - 1]
         cur_fast, cur_slow = df["ema_fast"].iloc[i], df["ema_slow"].iloc[i]
+        open_ = df["open"].iloc[i]
         price = df["close"].iloc[i]
         low = df["low"].iloc[i]
         ts = df["ts"].iloc[i]
@@ -124,16 +134,17 @@ def run_trend_following(df, sl_pct=None):
         cross_up = prev_fast <= prev_slow and cur_fast > cur_slow
         cross_down = prev_fast >= prev_slow and cur_fast < cur_slow
 
-        if position is None and cross_up:
-            entry_price = price * (1 + SLIPPAGE)
+        # Eksekusi sinyal candle sebelumnya: entry di open candle ini
+        if position is None and pending_entry:
+            entry_price = open_ * (1 + SLIPPAGE)
             sl_price = entry_price * (1 - sl_pct) if sl_pct else None
             position = {"entry_ts": ts, "entry_price": entry_price, "sl_price": sl_price}
-            continue
+        pending_entry = False
 
         if position is not None:
             # Cek stop-loss dulu (pakai low candle) sebelum cek sinyal exit normal
             if position["sl_price"] is not None and low <= position["sl_price"]:
-                exit_price = position["sl_price"] * (1 - SLIPPAGE)
+                exit_price = min(open_, position["sl_price"]) * (1 - SLIPPAGE)
                 pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE
                 trades.append({
                     "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
@@ -150,18 +161,24 @@ def run_trend_following(df, sl_pct=None):
                     "pnl_pct": pnl_pct, "exit_reason": "signal",
                 })
                 position = None
+
+        if position is None and cross_up:
+            pending_entry = True
     return trades
 
 
 def run_mean_reversion(df, sl_pct=None):
-    """Long-only RSI: masuk saat RSI < 30, keluar saat RSI > 50 ATAU saat harga
-    low candle menyentuh stop-loss, mana dulu terjadi.
-    sl_pct=None berarti tanpa stop-loss (perilaku lama)."""
+    """Long-only RSI: sinyal RSI < 30 di close candle i -> entry di open candle
+    i+1. Keluar saat RSI > 50 (di close) ATAU saat low candle menyentuh
+    stop-loss, mana dulu terjadi. Kalau open gap di bawah SL, fill di open.
+    sl_pct=None berarti tanpa stop-loss."""
     trades = []
     position = None
+    pending_entry = False
     for i in range(1, len(df)):
         rsi = df["rsi"].iloc[i]
         prev_rsi = df["rsi"].iloc[i - 1]
+        open_ = df["open"].iloc[i]
         price = df["close"].iloc[i]
         low = df["low"].iloc[i]
         ts = df["ts"].iloc[i]
@@ -172,15 +189,15 @@ def run_mean_reversion(df, sl_pct=None):
         enter_signal = prev_rsi >= RSI_OVERSOLD and rsi < RSI_OVERSOLD
         exit_signal = prev_rsi <= RSI_EXIT and rsi > RSI_EXIT
 
-        if position is None and enter_signal:
-            entry_price = price * (1 + SLIPPAGE)
+        if position is None and pending_entry:
+            entry_price = open_ * (1 + SLIPPAGE)
             sl_price = entry_price * (1 - sl_pct) if sl_pct else None
             position = {"entry_ts": ts, "entry_price": entry_price, "sl_price": sl_price}
-            continue
+        pending_entry = False
 
         if position is not None:
             if position["sl_price"] is not None and low <= position["sl_price"]:
-                exit_price = position["sl_price"] * (1 - SLIPPAGE)
+                exit_price = min(open_, position["sl_price"]) * (1 - SLIPPAGE)
                 pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE
                 trades.append({
                     "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
@@ -197,14 +214,17 @@ def run_mean_reversion(df, sl_pct=None):
                     "pnl_pct": pnl_pct, "exit_reason": "signal",
                 })
                 position = None
+
+        if position is None and enter_signal:
+            pending_entry = True
     return trades
 
 
-def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label):
+def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="full"):
     if not trades:
         return {
             "strategy": strategy_name, "symbol": symbol, "timeframe": timeframe,
-            "stop_loss": sl_label,
+            "stop_loss": sl_label, "period": period,
             "n_trades": 0, "total_return_pct": 0, "win_rate_pct": 0,
             "profit_factor": None, "max_drawdown_pct": 0, "avg_pnl_pct": 0,
             "sl_hit_rate_pct": 0,
@@ -236,7 +256,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label):
 
     return {
         "strategy": strategy_name, "symbol": symbol, "timeframe": timeframe,
-        "stop_loss": sl_label,
+        "stop_loss": sl_label, "period": period,
         "n_trades": n, "total_return_pct": round(total_return, 2),
         "win_rate_pct": round(win_rate, 1),
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else "inf",
@@ -244,6 +264,14 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label):
         "avg_pnl_pct": round(np.mean(pnls) * 100, 3),
         "sl_hit_rate_pct": round(sl_hit_rate, 1),
     }
+
+
+def split_by_period(trades, split_ts):
+    """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
+    split = str(split_ts)
+    is_trades = [t for t in trades if t["entry_ts"] < split]
+    oos_trades = [t for t in trades if t["entry_ts"] >= split]
+    return {"full": trades, "IS": is_trades, "OOS": oos_trades}
 
 
 def main():
@@ -263,6 +291,8 @@ def main():
             print(f"  -> SELESAI: {len(df)} candle didapat ({df['ts'].iloc[0]} s/d {df['ts'].iloc[-1]})")
 
             df = add_indicators(df)
+            # Titik tengah rentang waktu: sebelum = in-sample, sesudah = out-of-sample
+            split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
 
             for sl in SL_LEVELS:
                 sl_label = "none" if sl is None else f"{int(sl * 100)}%"
@@ -270,10 +300,10 @@ def main():
                 tf_trades = run_trend_following(df, sl_pct=sl)
                 mr_trades = run_mean_reversion(df, sl_pct=sl)
 
-                m1 = compute_metrics(tf_trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label)
-                m2 = compute_metrics(mr_trades, "MeanReversion_RSI14", symbol, tf, sl_label)
-                all_results.append(m1)
-                all_results.append(m2)
+                for period, trades in split_by_period(tf_trades, split_ts).items():
+                    all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, period))
+                for period, trades in split_by_period(mr_trades, split_ts).items():
+                    all_results.append(compute_metrics(trades, "MeanReversion_RSI14", symbol, tf, sl_label, period))
 
                 raw_trades[f"{symbol}_{tf}_trend_sl{sl_label}"] = tf_trades
                 raw_trades[f"{symbol}_{tf}_meanrev_sl{sl_label}"] = mr_trades
@@ -283,11 +313,11 @@ def main():
         json.dump({"summary": all_results, "trades": raw_trades}, f, indent=2, default=str)
 
     df_summary = pd.DataFrame(all_results)
-    df_summary = df_summary.sort_values(["timeframe", "strategy", "stop_loss"])
+    df_summary = df_summary.sort_values(["timeframe", "strategy", "stop_loss", "symbol", "period"])
     df_summary.to_csv(OUTPUT_CSV, index=False)
 
     print("\n" + "=" * 100)
-    print("RINGKASAN HASIL (diurutkan per timeframe, profit factor tertinggi dulu)")
+    print("RINGKASAN HASIL (per timeframe, strategi, SL, pair, periode full/IS/OOS)")
     print("=" * 100)
     print(df_summary.to_string(index=False))
     print(f"\nDisimpan ke: {OUTPUT_CSV} dan {OUTPUT_JSON}")
