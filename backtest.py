@@ -36,27 +36,48 @@ OUTPUT_CSV = "results_summary.csv"
 
 
 def fetch_ohlcv(exchange, symbol, timeframe, days_back):
-    """Ambil OHLCV lengkap dengan pagination, karena CCXT membatasi per-call."""
+    """Ambil OHLCV lengkap dengan pagination, karena CCXT membatasi per-call.
+    Berhenti hanya saat data sudah mencapai waktu sekarang, bukan saat satu
+    call mengembalikan kurang dari `limit` candle (Bitget bisa saja balas
+    sebagian meski masih ada data lebih lanjut)."""
     since = exchange.parse8601(
         (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
+    now_ms = exchange.milliseconds()
     all_candles = []
     limit = 1000
-    while True:
+    stall_count = 0
+    while since < now_ms:
         try:
             candles = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
         except Exception as e:
-            print(f"  [!] Error fetch {symbol} {timeframe}: {e}")
-            break
+            print(f"  [!] Error fetch {symbol} {timeframe} (since={since}): {e}, retry dalam 3s...")
+            time.sleep(3)
+            stall_count += 1
+            if stall_count > 5:
+                print(f"  [!] Gagal berulang, hentikan fetch {symbol} {timeframe}.")
+                break
+            continue
+
         if not candles:
-            break
+            # tidak ada data di jendela ini; majukan since 1 hari supaya tidak stuck
+            since += 86400000
+            stall_count += 1
+            if stall_count > 10:
+                break
+            continue
+
+        stall_count = 0
         all_candles.extend(candles)
         last_ts = candles[-1][0]
-        if last_ts == since or len(candles) < limit:
-            break
-        since = last_ts + 1
+        if last_ts <= since:
+            # exchange tidak maju sama sekali -> hindari infinite loop
+            since += 86400000
+        else:
+            since = last_ts + 1
+        print(f"    ...{len(all_candles)} candle terkumpul (sampai {candles[-1][0]})")
         time.sleep(exchange.rateLimit / 1000)
-        if len(all_candles) > 200000:  # safety cap
+        if len(all_candles) > 300000:  # safety cap
             break
 
     if not all_candles:
@@ -190,12 +211,12 @@ def main():
 
     for symbol in PAIRS:
         for tf in TIMEFRAMES:
-            print(f"Fetching {symbol} {tf} ({DAYS_BACK} hari)...")
+            print(f"\n=== Fetching {symbol} {tf} ({DAYS_BACK} hari) ===")
             df = fetch_ohlcv(exchange, symbol, tf, DAYS_BACK)
             if df is None or len(df) < 100:
-                print(f"  [!] Data tidak cukup untuk {symbol} {tf}, skip.")
+                print(f"  [!] Data tidak cukup untuk {symbol} {tf} (dapat {0 if df is None else len(df)} candle), skip.")
                 continue
-            print(f"  -> {len(df)} candle didapat ({df['ts'].iloc[0]} s/d {df['ts'].iloc[-1]})")
+            print(f"  -> SELESAI: {len(df)} candle didapat ({df['ts'].iloc[0]} s/d {df['ts'].iloc[-1]})")
 
             df = add_indicators(df)
 
