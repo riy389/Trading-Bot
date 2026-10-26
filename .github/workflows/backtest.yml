@@ -30,4 +30,5 @@ jobs:
           path: |
             results_summary.csv
             results.json
+            debug_*.csv
           if-no-files-found: warn
