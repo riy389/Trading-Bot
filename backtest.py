@@ -73,6 +73,7 @@ MODES = {"long_only": False, "long_short": True}
 
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
+# DEBUG_* ditulis oleh run_regime_switch_v2 saat _debug_label diisi (diagnostik sementara)
 # ===========================================
 
 
@@ -357,23 +358,38 @@ def run_regime_switch(df, sl_pct=None, allow_short=False):
     return _simulate(df, sl_pct, allow_short, get_signal)
 
 
-def run_regime_switch_v2(df, sl_pct=None, allow_short=False):
+def run_regime_switch_v2(df, sl_pct=None, allow_short=False, _debug_label=None):
     """V2 (B): sama seperti run_regime_switch (exit paksa saat regime berbalik),
     DITAMBAH SL tetap REGIME_SWITCH_TREND_SL (independen dari sl_pct) khusus
     untuk posisi trend, sebagai pengaman kalau exit paksa telat terdeteksi
     (ADX baru update per candle). Posisi meanrev tetap tanpa SL tambahan di
     luar sl_pct, sesuai temuan backtest sebelumnya (SL ketat merusak
-    mean-reversion)."""
+    mean-reversion).
+
+    _debug_label: kalau diisi (mis. "ETH_1h"), tulis trace per-candle ke
+    debug_<_debug_label>.csv selama posisi trend terbuka -- DIAGNOSTIK SEMENTARA,
+    akan dicabut setelah root cause ditemukan."""
     fast = df["ema_fast"].to_numpy()
     slow = df["ema_slow"].to_numpy()
     rsi = df["rsi"].to_numpy()
     adx = df["adx"].to_numpy()
+    tss_dbg = df["ts"].tolist()
 
     open_by = {"strategy": None}
+    debug_rows = [] if _debug_label else None
 
     def get_signal(i, position):
         a = adx[i]
         if position is not None:
+            if debug_rows is not None and open_by["strategy"] == "trend":
+                debug_rows.append({
+                    "i": i, "ts": str(tss_dbg[i]), "adx": a,
+                    "ema_fast": fast[i], "ema_slow": slow[i],
+                    "open_by": open_by["strategy"], "position_side": position["side"],
+                    "sl_price": position.get("sl_price"),
+                    "adx_below_range_threshold": (not np.isnan(a)) and a < ADX_RANGE_THRESHOLD,
+                    "ema_cross_down": fast[i-1] >= slow[i-1] and fast[i] < slow[i],
+                })
             if open_by["strategy"] == "trend" and not np.isnan(a) and a < ADX_RANGE_THRESHOLD:
                 return "flat"
             if open_by["strategy"] == "meanrev" and not np.isnan(a) and a > ADX_TREND_THRESHOLD:
@@ -421,7 +437,13 @@ def run_regime_switch_v2(df, sl_pct=None, allow_short=False):
     # SL per-posisi berbeda (trend pakai SL tetap, meanrev pakai sl_pct dari loop utama)
     # -> _simulate hanya terima satu sl_pct global, jadi dijalankan dengan wrapper
     # yang memilih sl_pct saat open_position terjadi.
-    return _simulate_regime_v2(df, sl_pct, allow_short, get_signal, open_by)
+    trades = _simulate_regime_v2(df, sl_pct, allow_short, get_signal, open_by)
+
+    if debug_rows is not None and debug_rows:
+        pd.DataFrame(debug_rows).to_csv(f"debug_{_debug_label}.csv", index=False)
+        print(f"  [DEBUG] Ditulis debug_{_debug_label}.csv ({len(debug_rows)} baris trace)")
+
+    return trades
 
 
 def _simulate_regime_v2(df, sl_pct, allow_short, get_signal, open_by):
@@ -538,7 +560,12 @@ def main():
                     tf_trades = run_trend_following(df, sl_pct=sl, allow_short=allow_short)
                     mr_trades = run_mean_reversion(df, sl_pct=sl, allow_short=allow_short)
                     rs_trades = run_regime_switch(df, sl_pct=sl, allow_short=allow_short)
-                    rs2_trades = run_regime_switch_v2(df, sl_pct=sl, allow_short=allow_short)
+                    # DIAGNOSTIK SEMENTARA: trace detail utk kasus ETH 1h sl=none long_only
+                    # yang diketahui bermasalah (posisi trend nyangkut 805 jam)
+                    debug_label = None
+                    if symbol == "ETH/USDT:USDT" and tf == "1h" and sl is None and mode == "long_only":
+                        debug_label = "ETH_1h_slnone_longonly"
+                    rs2_trades = run_regime_switch_v2(df, sl_pct=sl, allow_short=allow_short, _debug_label=debug_label)
 
                     for period, trades in split_by_period(tf_trades, split_ts).items():
                         all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, period, mode))
