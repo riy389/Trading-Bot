@@ -28,8 +28,13 @@ import json
 from datetime import datetime, timedelta, timezone
 
 # ============== KONFIGURASI ==============
-PAIRS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]  # Bitget perpetual swap
-TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+PAIRS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+    "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
+    "LTC/USDT:USDT", "DOT/USDT:USDT", "TRX/USDT:USDT",
+]  # Bitget perpetual swap
+TIMEFRAMES = ["1h", "4h"]
 DAYS_BACK = 365 * 2          # 2 tahun data
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
 ROUND_TRIP_FEE = TAKER_FEE * 2
