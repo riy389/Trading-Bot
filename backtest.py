@@ -91,7 +91,10 @@ def fetch_ohlcv(exchange, symbol, timeframe, days_back):
     )
     now_ms = exchange.milliseconds()
     all_candles = []
-    limit = 1000
+    # Bitget history-candles: maks 200 candle per call. Kalau limit lebih besar,
+    # window (limit x timeframe) tetap dicakup tapi hanya 200 candle TERAKHIR
+    # yang dikembalikan -> sisanya hilang (penyebab gap ~800 candle).
+    limit = 200
     stall_count = 0
     while since < now_ms:
         try:
