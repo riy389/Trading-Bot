@@ -29,6 +29,9 @@ jobs:
       - name: Run backtest
         run: python3 backtest.py
 
+      - name: Evaluate results
+        run: python3 evaluate.py
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
