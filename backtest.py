@@ -70,6 +70,12 @@ TP_R_MULTS = [None, 0.5, 1.0, 2.0]   # TP = R x jarak SL; None = tanpa TP
 RISK_PER_TRADE = 0.01                # risiko 1% ekuitas per trade
 MAX_LEVERAGE = 1.0                   # ukuran posisi maks = 1x ekuitas (tanpa leverage)
 
+# Konfluensi (filter searah sinyal strategi) + trailing SL
+EMA_TREND = 200        # long hanya kalau close > EMA200, short kalau close < EMA200
+BOS_PIVOT = 5          # swing high/low = ekstrem dalam +-5 candle
+CONF_SL_MULT = 2.0     # SL awal = 2 x ATR
+TRAIL_ATR_MULT = 2.0   # jarak trailing = 2 x ATR
+
 # Mode arah: nama -> boleh short?
 MODES = {"long_only": False, "long_short": True}
 
@@ -198,7 +204,31 @@ def add_indicators(df):
         (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
     df["atr"] = true_range.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
+    df["ema_trend"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean().where(df.index >= EMA_TREND)
+    df["bos"] = _compute_bos(df, BOS_PIVOT)
     return df
+
+
+def _compute_bos(df, n):
+    # Arah struktur: +1 setelah close tembus swing high terakhir, -1 setelah tembus
+    # swing low terakhir. Swing baru dikonfirmasi n candle kemudian (tanpa lookahead).
+    h, l, c = df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy()
+    state = np.zeros(len(df))
+    last_sh = last_sl = np.nan
+    cur = 0
+    for i in range(len(df)):
+        j = i - n
+        if j >= n:
+            if h[j] == h[j - n:i + 1].max():
+                last_sh = h[j]
+            if l[j] == l[j - n:i + 1].min():
+                last_sl = l[j]
+        if c[i] > last_sh:
+            cur = 1
+        elif c[i] < last_sl:
+            cur = -1
+        state[i] = cur
+    return state
 
 
 def _compute_adx(df, period):
@@ -228,7 +258,7 @@ def _compute_adx(df, period):
     return adx
 
 
-def _open_position(side, ts, open_, atr, sl_mult, tp_r):
+def _open_position(side, ts, open_, atr, sl_mult, tp_r, trail_mult=None):
     """Buka posisi di open candle. Slippage selalu merugikan. SL = sl_mult x ATR,
     TP = tp_r x jarak SL (atau None). Ukuran posisi = risiko 1% ekuitas / jarak SL,
     maks MAX_LEVERAGE. Return None kalau ATR tidak valid."""
@@ -242,6 +272,8 @@ def _open_position(side, ts, open_, atr, sl_mult, tp_r):
         "sl_price": entry_price - sign * sl_dist,
         "tp_price": entry_price + sign * tp_r * sl_dist if tp_r else None,
         "size": min(MAX_LEVERAGE, RISK_PER_TRADE / (sl_dist / entry_price)),
+        "extreme": entry_price,
+        "trail_dist": trail_mult * atr if trail_mult else None,
     }
 
 
@@ -263,6 +295,16 @@ def _exit_fill(position, open_, high, low):
     return None
 
 
+def _trail_stop(position, high, low):
+    """SL hanya bergerak ke arah profit (long naik, short turun), tidak pernah mundur."""
+    if position["side"] == "long":
+        position["extreme"] = max(position["extreme"], high)
+        position["sl_price"] = max(position["sl_price"], position["extreme"] - position["trail_dist"])
+    else:
+        position["extreme"] = min(position["extreme"], low)
+        position["sl_price"] = min(position["sl_price"], position["extreme"] + position["trail_dist"])
+
+
 def _close_position(position, ts, raw_exit_price, reason):
     if position["side"] == "long":
         exit_price = raw_exit_price * (1 - SLIPPAGE)
@@ -279,7 +321,7 @@ def _close_position(position, ts, raw_exit_price, reason):
     }
 
 
-def _simulate(df, sl_mult, tp_r, allow_short, get_signal):
+def _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult=None, filt=None):
     """Loop eksekusi bersama untuk semua strategi.
     get_signal(i, position) dipanggil di close candle i dan mengembalikan target
     untuk dieksekusi di open candle i+1: "long", "short", "flat", atau None.
@@ -301,7 +343,7 @@ def _simulate(df, sl_mult, tp_r, allow_short, get_signal):
                 trades.append(_close_position(position, tss[i], opens[i], "signal"))
                 position = None
             if position is None and (pending == "long" or (pending == "short" and allow_short)):
-                position = _open_position(pending, tss[i], opens[i], pending_atr, sl_mult, tp_r)
+                position = _open_position(pending, tss[i], opens[i], pending_atr, sl_mult, tp_r, trail_mult)
             pending = None
 
         # 2) Cek stop-loss / take-profit dalam candle ini (termasuk candle entry)
@@ -310,14 +352,21 @@ def _simulate(df, sl_mult, tp_r, allow_short, get_signal):
             if hit is not None:
                 trades.append(_close_position(position, tss[i], hit[0], hit[1]))
                 position = None
+            elif position["trail_dist"]:
+                _trail_stop(position, highs[i], lows[i])
 
         # 3) Sinyal baru dari close candle ini (ATR candle ini dipakai untuk SL/TP)
         pending = get_signal(i, position)
+        if trail_mult:
+            # mode konfluensi: sinyal hanya untuk ENTRY (exit lewat trailing SL),
+            # dan hanya kalau filter EMA200 + BOS searah dengan sinyal
+            if position is not None or pending not in ("long", "short") or not filt(i, pending):
+                pending = None
         pending_atr = atrs[i]
     return trades
 
 
-def run_trend_following(df, sl_mult, tp_r=None, allow_short=False):
+def run_trend_following(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
     """EMA cross: fast cross up slow -> long, cross down -> short (atau hanya
     tutup long kalau allow_short=False). Selalu reversal saat sinyal berlawanan."""
     fast = df["ema_fast"].to_numpy()
@@ -330,10 +379,10 @@ def run_trend_following(df, sl_mult, tp_r=None, allow_short=False):
             return "short"
         return None
 
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal)
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
 
 
-def run_mean_reversion(df, sl_mult, tp_r=None, allow_short=False):
+def run_mean_reversion(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
     """RSI: cross di bawah 30 -> long, keluar saat cross di atas 50.
     Kalau allow_short: cross di atas 70 -> short, keluar saat cross di bawah 50."""
     rsi = df["rsi"].to_numpy()
@@ -353,10 +402,10 @@ def run_mean_reversion(df, sl_mult, tp_r=None, allow_short=False):
             return "short"
         return None
 
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal)
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
 
 
-def run_regime_switch(df, sl_mult, tp_r=None, allow_short=False):
+def run_regime_switch(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
     """ADX menentukan strategi mana yang aktif di candle ini:
     - ADX > ADX_TREND_THRESHOLD -> sinyal EMA cross (trend-following)
     - ADX < ADX_RANGE_THRESHOLD -> sinyal RSI (mean-reversion)
@@ -424,7 +473,19 @@ def run_regime_switch(df, sl_mult, tp_r=None, allow_short=False):
                 return "short"
         return None
 
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal)
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
+
+
+def make_confluence_filter(df):
+    close = df["close"].to_numpy()
+    ema_trend = df["ema_trend"].to_numpy()
+    bos = df["bos"].to_numpy()
+
+    def filt(i, side):
+        s = 1 if side == "long" else -1
+        return (close[i] - ema_trend[i]) * s > 0 and bos[i] == s
+
+    return filt
 
 
 def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label, period="full", mode="long_only"):
@@ -538,6 +599,20 @@ def main():
                         raw_trades[key % "trend"] = tf_trades
                         raw_trades[key % "meanrev"] = mr_trades
                         raw_trades[key % "regimeswitch"] = rs_trades
+
+            # Konfluensi: sinyal strategi + filter EMA200 & BOS searah, exit trailing SL
+            conf_filt = make_confluence_filter(df)
+            conf_sl, conf_tp = f"ATRx{CONF_SL_MULT:g}", f"trail{TRAIL_ATR_MULT:g}"
+            for mode, allow_short in MODES.items():
+                for name, tag, run in (
+                    ("TrendFollowing_EMA21_55_Conf", "trend", run_trend_following),
+                    ("MeanReversion_RSI14_Conf", "meanrev", run_mean_reversion),
+                    ("RegimeSwitch_ADX_Conf", "regimeswitch", run_regime_switch),
+                ):
+                    trades = run(df, CONF_SL_MULT, None, allow_short, TRAIL_ATR_MULT, conf_filt)
+                    for period, tr in split_by_period(trades, split_ts).items():
+                        all_results.append(compute_metrics(tr, name, symbol, tf, conf_sl, conf_tp, period, mode))
+                    raw_trades[f"{symbol}_{tf}_{tag}_sl{conf_sl}_tp{conf_tp}_{mode}"] = trades
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
