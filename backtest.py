@@ -71,6 +71,10 @@ SL_LEVELS = [None, 0.01, 0.02, 0.03, 0.05, 0.08, 0.10]
 # Mode arah: nama -> boleh short?
 MODES = {"long_only": False, "long_short": True}
 
+# Validasi data: gap lebih dari ini (dalam jumlah candle hilang) -> pair/timeframe di-skip
+# supaya SL tidak disimulasikan melewati data yang hilang. Gap kecil ditoleransi.
+MAX_GAP_CANDLES = 3
+
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
 # DEBUG_* ditulis oleh run_regime_switch_v2 saat _debug_label diisi (diagnostik sementara)
@@ -129,6 +133,19 @@ def fetch_ohlcv(exchange, symbol, timeframe, days_back):
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
     return df
+
+
+def find_ohlcv_gaps(df, timeframe):
+    """Daftar (ts_sebelum, ts_sesudah, jumlah_candle_hilang) untuk tiap lompatan
+    waktu yang lebih besar dari satu periode timeframe."""
+    expected = pd.Timedelta(timeframe)
+    deltas = df["ts"].diff()
+    gaps = []
+    for idx in deltas[deltas > expected].index:
+        missing = int(round(deltas[idx] / expected)) - 1
+        if missing > 0:
+            gaps.append((df["ts"].iloc[idx - 1], df["ts"].iloc[idx], missing))
+    return gaps
 
 
 def add_indicators(df):
@@ -549,6 +566,16 @@ def main():
                 continue
             print(f"  -> SELESAI: {len(df)} candle didapat ({df['ts'].iloc[0]} s/d {df['ts'].iloc[-1]})")
 
+            gaps = find_ohlcv_gaps(df, tf)
+            if gaps:
+                print(f"  [gap] {len(gaps)} gap, total {sum(g[2] for g in gaps)} candle hilang, terbesar {max(g[2] for g in gaps)}")
+            big_gaps = [g for g in gaps if g[2] > MAX_GAP_CANDLES]
+            if big_gaps:
+                for before, after, missing in big_gaps[:3]:
+                    print(f"      {before} -> {after} (~{missing} candle hilang)")
+                print(f"  [!] {len(big_gaps)} gap besar (> {MAX_GAP_CANDLES} candle) di {symbol} {tf}, skip agar SL tidak disimulasikan melewati data hilang.")
+                continue
+
             df = add_indicators(df)
             # Titik tengah rentang waktu: sebelum = in-sample, sesudah = out-of-sample
             split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
@@ -580,6 +607,9 @@ def main():
                     raw_trades[f"{symbol}_{tf}_meanrev_sl{sl_label}_{mode}"] = mr_trades
                     raw_trades[f"{symbol}_{tf}_regimeswitch_sl{sl_label}_{mode}"] = rs_trades
                     raw_trades[f"{symbol}_{tf}_regimeswitchv2_sl{sl_label}_{mode}"] = rs2_trades
+
+    if not all_results:
+        raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
 
     # simpan hasil
     with open(OUTPUT_JSON, "w") as f:
