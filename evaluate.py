@@ -17,7 +17,7 @@ OOS_PF_MIN = 1.5
 OOS_WR_MIN = 55.0
 OOS_MIN_TRADES = 30
 TOP_N = 15
-KEY = ["strategy", "mode", "timeframe", "stop_loss"]
+KEY = ["strategy", "mode", "timeframe", "stop_loss", "take_profit"]
 
 
 def load(path):
@@ -62,7 +62,7 @@ def render(out):
     for name, r in per.iterrows():
         lines.append(f"- {name}: {int(r['sum'])}/{int(r['count'])}")
     lines += ["", f"### Top {TOP_N} (urut jumlah pair lulus)", "```"]
-    cols = ["strategy", "mode", "timeframe", "stop_loss", "pass_pairs", "pairs",
+    cols = ["strategy", "mode", "timeframe", "stop_loss", "take_profit", "pass_pairs", "pairs",
             "med_pf_is", "med_pf_oos", "med_wr_oos", "med_ret_oos", "med_dd_oos", "med_n_oos"]
     top = out.head(TOP_N)[cols].copy()
     top["strategy"] = top["strategy"].str.replace("RegimeSwitch", "RS").str.replace("TrendFollowing_EMA21_55", "Trend").str.replace("MeanReversion_RSI14", "MeanRev")

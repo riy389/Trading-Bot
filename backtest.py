@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Backtest engine sederhana: Trend-Following (EMA cross) vs Mean-Reversion (RSI)
-vs Regime-Switch (ADX menentukan mode mana yang aktif).
+Backtest engine sederhana: Trend-Following (EMA cross), Mean-Reversion (RSI)
+dan Regime-Switch (ADX memilih strategi mana yang aktif).
 Data asli dari Bitget via CCXT. Fee Bitget nyata, tanpa leverage.
 
 Cara pakai:
@@ -13,22 +13,23 @@ Edit PAIRS / TIMEFRAMES / DAYS_BACK di bawah untuk ubah cakupan uji.
 Asumsi eksekusi:
 - Sinyal dihitung dari close candle i. SEMUA aksi (entry, exit sinyal, reversal)
   dieksekusi di OPEN candle i+1, bukan di close candle sinyal.
-- Stop-loss dicek mulai candle entry (low untuk long, high untuk short). Kalau
-  open gap melewati SL, fill di open (lebih buruk dari harga SL).
+- SEMUA posisi wajib punya stop-loss: jarak SL = SL_ATR_MULTS x ATR candle sinyal.
+  Take-profit (opsional) = TP_R_MULTS x jarak SL; None = tanpa TP (exit lewat
+  sinyal strategi). SL/TP dicek mulai candle entry. Kalau SL dan TP sama-sama
+  tersentuh di satu candle, SL dianggap kena duluan (konservatif). Kalau open
+  gap melewati SL, fill di open (lebih buruk dari harga SL); TP fill di harga TP.
+- Ukuran posisi: risiko RISK_PER_TRADE dari ekuitas per trade, maks MAX_LEVERAGE x
+  ekuitas. pnl_pct di hasil = persen terhadap EKUITAS (sudah dikali ukuran posisi,
+  setelah fee dan slippage).
 - Dua mode: long_only dan long_short (short saat sinyal berlawanan).
   Funding rate perpetual TIDAK dimodelkan.
 - Hasil dilaporkan 3 periode: full, IS (paruh pertama), OOS (paruh kedua).
   Trade dimasukkan ke IS/OOS berdasarkan waktu entry.
-- Regime-Switch (dua varian): ADX>ADX_TREND_THRESHOLD pakai sinyal EMA cross
-  (trend-following), ADX<ADX_RANGE_THRESHOLD pakai sinyal RSI (mean-reversion),
-  di antara keduanya tidak ada entry baru. Posisi yang sudah terbuka ditutup
-  PAKSA ("flat") begitu regime jelas berbalik ke lawannya (trend->ranging atau
-  sebaliknya), supaya tidak nyangkut lama menunggu sinyal strategi asal (bug
-  yang ditemukan: EMA cross sangat lambat bereaksi saat tren melemah pelan).
-  V1 (run_regime_switch) hanya exit paksa + SL dari SL_LEVELS seperti biasa.
-  V2 (run_regime_switch_v2) sama, ditambah SL tetap (REGIME_SWITCH_TREND_SL)
-  khusus posisi trend sebagai pengaman tambahan; posisi meanrev tetap pakai
-  sl_pct dari SL_LEVELS seperti biasa (tanpa SL tambahan di luar itu).
+- Regime-Switch: ADX>ADX_TREND_THRESHOLD pakai sinyal EMA cross (trend-following),
+  ADX<ADX_RANGE_THRESHOLD pakai sinyal RSI (mean-reversion), di antara keduanya
+  tidak ada entry baru. Posisi yang sudah terbuka ditutup PAKSA ("flat") begitu
+  regime jelas berbalik ke lawannya, supaya tidak nyangkut menunggu sinyal
+  strategi asal.
 """
 
 import ccxt
@@ -62,12 +63,12 @@ ADX_PERIOD = 14
 ADX_TREND_THRESHOLD = 25   # ADX > ini -> regime trending, pakai EMA cross
 ADX_RANGE_THRESHOLD = 20   # ADX < ini -> regime ranging, pakai RSI mean-reversion
 
-# SL tetap khusus posisi trend di run_regime_switch_v2 (independen dari SL_LEVELS loop utama)
-REGIME_SWITCH_TREND_SL = 0.02
-
-# Stop-loss: beberapa level diuji sekaligus (persentase dari harga entry).
-# None berarti tanpa SL (baseline lama, untuk perbandingan).
-SL_LEVELS = [None, 0.01, 0.02, 0.03, 0.05, 0.08, 0.10]
+# Manajemen risiko (SL wajib, tidak ada opsi tanpa SL)
+ATR_PERIOD = 14
+SL_ATR_MULTS = [1.5, 2.0, 3.0]       # jarak SL = mult x ATR saat sinyal
+TP_R_MULTS = [None, 0.5, 1.0, 2.0]   # TP = R x jarak SL; None = tanpa TP
+RISK_PER_TRADE = 0.01                # risiko 1% ekuitas per trade
+MAX_LEVERAGE = 1.0                   # ukuran posisi maks = 1x ekuitas (tanpa leverage)
 
 # Mode arah: nama -> boleh short?
 MODES = {"long_only": False, "long_short": True}
@@ -189,6 +190,14 @@ def add_indicators(df):
     df["rsi"] = 100 - (100 / (1 + rs))
 
     df["adx"] = _compute_adx(df, ADX_PERIOD)
+
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = true_range.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
     return df
 
 
@@ -219,26 +228,39 @@ def _compute_adx(df, period):
     return adx
 
 
-def _open_position(side, ts, open_, sl_pct):
-    """Buka posisi di open candle. Slippage selalu merugikan."""
-    if side == "long":
-        entry_price = open_ * (1 + SLIPPAGE)
-        sl_price = entry_price * (1 - sl_pct) if sl_pct else None
-    else:
-        entry_price = open_ * (1 - SLIPPAGE)
-        sl_price = entry_price * (1 + sl_pct) if sl_pct else None
-    return {"side": side, "entry_ts": ts, "entry_price": entry_price, "sl_price": sl_price}
-
-
-def _sl_fill(position, open_, high, low):
-    """Harga fill mentah (sebelum slippage) kalau SL tersentuh, selain itu None.
-    Kalau open gap melewati SL, fill di open (lebih buruk dari harga SL)."""
-    sl = position["sl_price"]
-    if sl is None:
+def _open_position(side, ts, open_, atr, sl_mult, tp_r):
+    """Buka posisi di open candle. Slippage selalu merugikan. SL = sl_mult x ATR,
+    TP = tp_r x jarak SL (atau None). Ukuran posisi = risiko 1% ekuitas / jarak SL,
+    maks MAX_LEVERAGE. Return None kalau ATR tidak valid."""
+    if not atr > 0:
         return None
+    sign = 1 if side == "long" else -1
+    entry_price = open_ * (1 + sign * SLIPPAGE)
+    sl_dist = sl_mult * atr
+    return {
+        "side": side, "entry_ts": ts, "entry_price": entry_price,
+        "sl_price": entry_price - sign * sl_dist,
+        "tp_price": entry_price + sign * tp_r * sl_dist if tp_r else None,
+        "size": min(MAX_LEVERAGE, RISK_PER_TRADE / (sl_dist / entry_price)),
+    }
+
+
+def _exit_fill(position, open_, high, low):
+    """(harga fill mentah sebelum slippage, alasan) kalau SL/TP tersentuh di candle
+    ini, selain itu None. SL dicek duluan (konservatif kalau keduanya tersentuh).
+    Kalau open gap melewati SL, fill di open. TP fill di harga TP."""
+    sl, tp = position["sl_price"], position["tp_price"]
     if position["side"] == "long":
-        return min(open_, sl) if low <= sl else None
-    return max(open_, sl) if high >= sl else None
+        if low <= sl:
+            return min(open_, sl), "stop_loss"
+        if tp is not None and high >= tp:
+            return tp, "take_profit"
+    else:
+        if high >= sl:
+            return max(open_, sl), "stop_loss"
+        if tp is not None and low <= tp:
+            return tp, "take_profit"
+    return None
 
 
 def _close_position(position, ts, raw_exit_price, reason):
@@ -252,11 +274,12 @@ def _close_position(position, ts, raw_exit_price, reason):
         "side": position["side"],
         "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
         "entry_price": position["entry_price"], "exit_price": exit_price,
-        "pnl_pct": gross - ROUND_TRIP_FEE, "exit_reason": reason,
+        "size": position["size"],
+        "pnl_pct": (gross - ROUND_TRIP_FEE) * position["size"], "exit_reason": reason,
     }
 
 
-def _simulate(df, sl_pct, allow_short, get_signal):
+def _simulate(df, sl_mult, tp_r, allow_short, get_signal):
     """Loop eksekusi bersama untuk semua strategi.
     get_signal(i, position) dipanggil di close candle i dan mengembalikan target
     untuk dieksekusi di open candle i+1: "long", "short", "flat", atau None.
@@ -264,11 +287,13 @@ def _simulate(df, sl_pct, allow_short, get_signal):
     opens = df["open"].to_numpy()
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
+    atrs = df["atr"].to_numpy()
     tss = df["ts"].tolist()
 
     trades = []
     position = None
     pending = None
+    pending_atr = None
     for i in range(1, len(df)):
         # 1) Eksekusi sinyal dari candle sebelumnya di open candle ini
         if pending is not None:
@@ -276,22 +301,23 @@ def _simulate(df, sl_pct, allow_short, get_signal):
                 trades.append(_close_position(position, tss[i], opens[i], "signal"))
                 position = None
             if position is None and (pending == "long" or (pending == "short" and allow_short)):
-                position = _open_position(pending, tss[i], opens[i], sl_pct)
+                position = _open_position(pending, tss[i], opens[i], pending_atr, sl_mult, tp_r)
             pending = None
 
-        # 2) Cek stop-loss dalam candle ini (termasuk candle entry)
+        # 2) Cek stop-loss / take-profit dalam candle ini (termasuk candle entry)
         if position is not None:
-            fill = _sl_fill(position, opens[i], highs[i], lows[i])
-            if fill is not None:
-                trades.append(_close_position(position, tss[i], fill, "stop_loss"))
+            hit = _exit_fill(position, opens[i], highs[i], lows[i])
+            if hit is not None:
+                trades.append(_close_position(position, tss[i], hit[0], hit[1]))
                 position = None
 
-        # 3) Sinyal baru dari close candle ini
+        # 3) Sinyal baru dari close candle ini (ATR candle ini dipakai untuk SL/TP)
         pending = get_signal(i, position)
+        pending_atr = atrs[i]
     return trades
 
 
-def run_trend_following(df, sl_pct=None, allow_short=False):
+def run_trend_following(df, sl_mult, tp_r=None, allow_short=False):
     """EMA cross: fast cross up slow -> long, cross down -> short (atau hanya
     tutup long kalau allow_short=False). Selalu reversal saat sinyal berlawanan."""
     fast = df["ema_fast"].to_numpy()
@@ -304,10 +330,10 @@ def run_trend_following(df, sl_pct=None, allow_short=False):
             return "short"
         return None
 
-    return _simulate(df, sl_pct, allow_short, get_signal)
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal)
 
 
-def run_mean_reversion(df, sl_pct=None, allow_short=False):
+def run_mean_reversion(df, sl_mult, tp_r=None, allow_short=False):
     """RSI: cross di bawah 30 -> long, keluar saat cross di atas 50.
     Kalau allow_short: cross di atas 70 -> short, keluar saat cross di bawah 50."""
     rsi = df["rsi"].to_numpy()
@@ -327,11 +353,11 @@ def run_mean_reversion(df, sl_pct=None, allow_short=False):
             return "short"
         return None
 
-    return _simulate(df, sl_pct, allow_short, get_signal)
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal)
 
 
-def run_regime_switch(df, sl_pct=None, allow_short=False):
-    """V1 (A): ADX menentukan strategi mana yang aktif di candle ini:
+def run_regime_switch(df, sl_mult, tp_r=None, allow_short=False):
+    """ADX menentukan strategi mana yang aktif di candle ini:
     - ADX > ADX_TREND_THRESHOLD -> sinyal EMA cross (trend-following)
     - ADX < ADX_RANGE_THRESHOLD -> sinyal RSI (mean-reversion)
     - di antara keduanya -> tidak ada entry baru (posisi existing tetap exit normal)
@@ -339,8 +365,7 @@ def run_regime_switch(df, sl_pct=None, allow_short=False):
     posisi trend, RSI=50 cross untuk posisi mean-reversion), DITAMBAH exit paksa
     kalau regime sudah jelas berbalik total (posisi trend ditutup segera saat
     ADX turun di bawah ADX_RANGE_THRESHOLD; posisi meanrev ditutup segera saat
-    ADX naik di atas ADX_TREND_THRESHOLD) -- supaya posisi tidak nyangkut lama
-    menunggu sinyal strategi asal sementara regime sudah berubah."""
+    ADX naik di atas ADX_TREND_THRESHOLD). SL/TP berlaku sama untuk kedua kaki."""
     fast = df["ema_fast"].to_numpy()
     slow = df["ema_slow"].to_numpy()
     rsi = df["rsi"].to_numpy()
@@ -399,120 +424,20 @@ def run_regime_switch(df, sl_pct=None, allow_short=False):
                 return "short"
         return None
 
-    return _simulate(df, sl_pct, allow_short, get_signal)
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal)
 
 
-def run_regime_switch_v2(df, sl_pct=None, allow_short=False):
-    """V2 (B): sama seperti run_regime_switch (exit paksa saat regime berbalik),
-    DITAMBAH SL tetap REGIME_SWITCH_TREND_SL (independen dari sl_pct) khusus
-    untuk posisi trend, sebagai pengaman kalau exit paksa telat terdeteksi
-    (ADX baru update per candle). Posisi meanrev tetap tanpa SL tambahan di
-    luar sl_pct, sesuai temuan backtest sebelumnya (SL ketat merusak
-    mean-reversion)."""
-    fast = df["ema_fast"].to_numpy()
-    slow = df["ema_slow"].to_numpy()
-    rsi = df["rsi"].to_numpy()
-    adx = df["adx"].to_numpy()
-
-    open_by = {"strategy": None}
-
-    def get_signal(i, position):
-        a = adx[i]
-        if position is not None:
-            if open_by["strategy"] == "trend" and not np.isnan(a) and a < ADX_RANGE_THRESHOLD:
-                return "flat"
-            if open_by["strategy"] == "meanrev" and not np.isnan(a) and a > ADX_TREND_THRESHOLD:
-                return "flat"
-
-            if open_by["strategy"] == "trend":
-                if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
-                    return "long"
-                if fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
-                    return "short"
-                return None
-            if open_by["strategy"] == "meanrev":
-                r, p = rsi[i], rsi[i - 1]
-                if np.isnan(r) or np.isnan(p):
-                    return None
-                side = position["side"]
-                if side == "long" and p <= RSI_EXIT < r:
-                    return "flat"
-                if side == "short" and p >= RSI_EXIT > r:
-                    return "flat"
-                return None
-            return None
-
-        if np.isnan(a):
-            return None
-        if a > ADX_TREND_THRESHOLD:
-            if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
-                open_by["strategy"] = "trend"
-                return "long"
-            if fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
-                open_by["strategy"] = "trend"
-                return "short"
-        elif a < ADX_RANGE_THRESHOLD:
-            r, p = rsi[i], rsi[i - 1]
-            if np.isnan(r) or np.isnan(p):
-                return None
-            if p >= RSI_OVERSOLD and r < RSI_OVERSOLD:
-                open_by["strategy"] = "meanrev"
-                return "long"
-            if p <= RSI_OVERBOUGHT and r > RSI_OVERBOUGHT:
-                open_by["strategy"] = "meanrev"
-                return "short"
-        return None
-
-    # SL per-posisi berbeda (trend pakai SL tetap, meanrev pakai sl_pct dari loop utama)
-    # -> _simulate hanya terima satu sl_pct global, jadi dijalankan dengan wrapper
-    # yang memilih sl_pct saat open_position terjadi.
-    trades = _simulate_regime_v2(df, sl_pct, allow_short, get_signal, open_by)
-
-    return trades
-
-
-def _simulate_regime_v2(df, sl_pct, allow_short, get_signal, open_by):
-    """Varian _simulate khusus run_regime_switch_v2: SL posisi trend selalu
-    REGIME_SWITCH_TREND_SL, SL posisi meanrev memakai sl_pct seperti biasa."""
-    opens = df["open"].to_numpy()
-    highs = df["high"].to_numpy()
-    lows = df["low"].to_numpy()
-    tss = df["ts"].tolist()
-
-    trades = []
-    position = None
-    pending = None
-    for i in range(1, len(df)):
-        if pending is not None:
-            if position is not None and position["side"] != pending:
-                trades.append(_close_position(position, tss[i], opens[i], "signal"))
-                position = None
-            if position is None and (pending == "long" or (pending == "short" and allow_short)):
-                effective_sl = REGIME_SWITCH_TREND_SL if open_by["strategy"] == "trend" else sl_pct
-                position = _open_position(pending, tss[i], opens[i], effective_sl)
-            pending = None
-
-        if position is not None:
-            fill = _sl_fill(position, opens[i], highs[i], lows[i])
-            if fill is not None:
-                trades.append(_close_position(position, tss[i], fill, "stop_loss"))
-                position = None
-
-        pending = get_signal(i, position)
-    return trades
-
-
-def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="full", mode="long_only"):
+def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label, period="full", mode="long_only"):
     base = {
         "strategy": strategy_name, "symbol": symbol, "timeframe": timeframe,
-        "mode": mode, "stop_loss": sl_label, "period": period,
+        "mode": mode, "stop_loss": sl_label, "take_profit": tp_label, "period": period,
     }
     if not trades:
         return {
             **base,
             "n_trades": 0, "total_return_pct": 0, "win_rate_pct": 0,
             "profit_factor": None, "max_drawdown_pct": 0, "avg_pnl_pct": 0,
-            "sl_hit_rate_pct": 0,
+            "sl_hit_rate_pct": 0, "tp_hit_rate_pct": 0,
         }
 
     pnls = [t["pnl_pct"] for t in trades]
@@ -538,6 +463,8 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="
 
     sl_hits = sum(1 for t in trades if t.get("exit_reason") == "stop_loss")
     sl_hit_rate = sl_hits / n * 100
+    tp_hits = sum(1 for t in trades if t.get("exit_reason") == "take_profit")
+    tp_hit_rate = tp_hits / n * 100
 
     return {
         **base,
@@ -547,6 +474,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, period="
         "max_drawdown_pct": round(max_dd, 2),
         "avg_pnl_pct": round(np.mean(pnls) * 100, 3),
         "sl_hit_rate_pct": round(sl_hit_rate, 1),
+        "tp_hit_rate_pct": round(tp_hit_rate, 1),
     }
 
 
@@ -588,28 +516,28 @@ def main():
             # Titik tengah rentang waktu: sebelum = in-sample, sesudah = out-of-sample
             split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
 
-            for sl in SL_LEVELS:
-                sl_label = "none" if sl is None else f"{int(sl * 100)}%"
+            for sl in SL_ATR_MULTS:
+                sl_label = f"ATRx{sl:g}"
 
-                for mode, allow_short in MODES.items():
-                    tf_trades = run_trend_following(df, sl_pct=sl, allow_short=allow_short)
-                    mr_trades = run_mean_reversion(df, sl_pct=sl, allow_short=allow_short)
-                    rs_trades = run_regime_switch(df, sl_pct=sl, allow_short=allow_short)
-                    rs2_trades = run_regime_switch_v2(df, sl_pct=sl, allow_short=allow_short)
+                for tp in TP_R_MULTS:
+                    tp_label = "none" if tp is None else f"{tp:g}R"
 
-                    for period, trades in split_by_period(tf_trades, split_ts).items():
-                        all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, period, mode))
-                    for period, trades in split_by_period(mr_trades, split_ts).items():
-                        all_results.append(compute_metrics(trades, "MeanReversion_RSI14", symbol, tf, sl_label, period, mode))
-                    for period, trades in split_by_period(rs_trades, split_ts).items():
-                        all_results.append(compute_metrics(trades, "RegimeSwitch_ADX", symbol, tf, sl_label, period, mode))
-                    for period, trades in split_by_period(rs2_trades, split_ts).items():
-                        all_results.append(compute_metrics(trades, "RegimeSwitch_V2_ADX", symbol, tf, sl_label, period, mode))
+                    for mode, allow_short in MODES.items():
+                        tf_trades = run_trend_following(df, sl, tp, allow_short)
+                        mr_trades = run_mean_reversion(df, sl, tp, allow_short)
+                        rs_trades = run_regime_switch(df, sl, tp, allow_short)
 
-                    raw_trades[f"{symbol}_{tf}_trend_sl{sl_label}_{mode}"] = tf_trades
-                    raw_trades[f"{symbol}_{tf}_meanrev_sl{sl_label}_{mode}"] = mr_trades
-                    raw_trades[f"{symbol}_{tf}_regimeswitch_sl{sl_label}_{mode}"] = rs_trades
-                    raw_trades[f"{symbol}_{tf}_regimeswitchv2_sl{sl_label}_{mode}"] = rs2_trades
+                        for period, trades in split_by_period(tf_trades, split_ts).items():
+                            all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, tp_label, period, mode))
+                        for period, trades in split_by_period(mr_trades, split_ts).items():
+                            all_results.append(compute_metrics(trades, "MeanReversion_RSI14", symbol, tf, sl_label, tp_label, period, mode))
+                        for period, trades in split_by_period(rs_trades, split_ts).items():
+                            all_results.append(compute_metrics(trades, "RegimeSwitch_ADX", symbol, tf, sl_label, tp_label, period, mode))
+
+                        key = f"{symbol}_{tf}_%s_sl{sl_label}_tp{tp_label}_{mode}"
+                        raw_trades[key % "trend"] = tf_trades
+                        raw_trades[key % "meanrev"] = mr_trades
+                        raw_trades[key % "regimeswitch"] = rs_trades
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
@@ -619,11 +547,11 @@ def main():
         json.dump({"summary": all_results, "trades": raw_trades}, f, indent=2, default=str)
 
     df_summary = pd.DataFrame(all_results)
-    df_summary = df_summary.sort_values(["timeframe", "strategy", "mode", "stop_loss", "symbol", "period"])
+    df_summary = df_summary.sort_values(["timeframe", "strategy", "mode", "stop_loss", "take_profit", "symbol", "period"])
     df_summary.to_csv(OUTPUT_CSV, index=False)
 
     print("\n" + "=" * 100)
-    print("RINGKASAN HASIL (per timeframe, strategi, mode, SL, pair, periode full/IS/OOS)")
+    print("RINGKASAN HASIL (per timeframe, strategi, mode, SL, TP, pair, periode full/IS/OOS)")
     print("=" * 100)
     print(df_summary.to_string(index=False))
     print(f"\nDisimpan ke: {OUTPUT_CSV} dan {OUTPUT_JSON}")
