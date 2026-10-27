@@ -19,6 +19,13 @@ jobs:
       - name: Install dependencies
         run: pip install ccxt pandas numpy
 
+      - name: Cache candles
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+
       - name: Run backtest
         run: python3 backtest.py
 

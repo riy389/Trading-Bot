@@ -34,6 +34,7 @@ Asumsi eksekusi:
 import ccxt
 import pandas as pd
 import numpy as np
+import os
 import time
 import json
 from datetime import datetime, timedelta, timezone
@@ -75,17 +76,18 @@ MODES = {"long_only": False, "long_short": True}
 # supaya SL tidak disimulasikan melewati data yang hilang. Gap kecil ditoleransi.
 MAX_GAP_CANDLES = 3
 
+CACHE_DIR = "cache"          # cache candle per pair/timeframe (CSV)
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
 # ===========================================
 
 
-def fetch_ohlcv(exchange, symbol, timeframe, days_back):
+def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None):
     """Ambil OHLCV lengkap dengan pagination, karena CCXT membatasi per-call.
     Berhenti hanya saat data sudah mencapai waktu sekarang, bukan saat satu
     call mengembalikan kurang dari `limit` candle (Bitget bisa saja balas
     sebagian meski masih ada data lebih lanjut)."""
-    since = exchange.parse8601(
+    since = since_ms if since_ms is not None else exchange.parse8601(
         (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
     now_ms = exchange.milliseconds()
@@ -134,6 +136,29 @@ def fetch_ohlcv(exchange, symbol, timeframe, days_back):
     df = pd.DataFrame(all_candles, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
+    return df
+
+
+def fetch_ohlcv_cached(exchange, symbol, timeframe, days_back):
+    """fetch_ohlcv dengan cache CSV: hanya ambil candle sejak candle terakhir di
+    cache (candle terakhir diambil ulang karena bisa saja belum selesai)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{symbol.split(':')[0].replace('/', '_')}_{timeframe}.csv")
+    cached, since_ms = None, None
+    if os.path.exists(path):
+        cached = pd.read_csv(path)
+        cached["ts"] = pd.to_datetime(cached["ts"], utc=True)
+        if len(cached):
+            since_ms = int(cached["ts"].iloc[-1].timestamp() * 1000)
+    new = fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms)
+    parts = [d for d in (cached, new) if d is not None and len(d)]
+    if not parts:
+        return None
+    df = pd.concat(parts).drop_duplicates(subset="ts", keep="last").sort_values("ts")
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days_back)
+    df = df[df["ts"] >= cutoff].reset_index(drop=True)
+    df.to_csv(path, index=False)
+    print(f"  [cache] {0 if cached is None else len(cached)} dari cache + {0 if new is None else len(new)} baru")
     return df
 
 
@@ -543,7 +568,7 @@ def main():
     for symbol in PAIRS:
         for tf in TIMEFRAMES:
             print(f"\n=== Fetching {symbol} {tf} ({DAYS_BACK} hari) ===")
-            df = fetch_ohlcv(exchange, symbol, tf, DAYS_BACK)
+            df = fetch_ohlcv_cached(exchange, symbol, tf, DAYS_BACK)
             if df is None or len(df) < 100:
                 print(f"  [!] Data tidak cukup untuk {symbol} {tf} (dapat {0 if df is None else len(df)} candle), skip.")
                 continue
