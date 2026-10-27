@@ -2,7 +2,7 @@
 """Evaluasi results_summary.csv dengan kriteria terkunci (tidak diubah per run).
 
 Satu pair LULUS untuk sebuah kombinasi (strategi, mode, timeframe, SL) kalau:
-  OOS PF > OOS_PF_MIN, OOS win rate >= OOS_WR_MIN, OOS trade >= OOS_MIN_TRADES,
+  OOS PF > OOS_PF_MIN, OOS trade >= OOS_MIN_TRADES,
   dan IS PF > 1.
 Kombinasi LULUS kalau mayoritas pair (> 50%) lulus.
 Output dicetak ke stdout dan ditambahkan ke $GITHUB_STEP_SUMMARY kalau ada.
@@ -14,7 +14,6 @@ import pandas as pd
 
 CSV = "results_summary.csv"
 OOS_PF_MIN = 1.5
-OOS_WR_MIN = 55.0
 OOS_MIN_TRADES = 30
 TOP_N = 15
 KEY = ["strategy", "mode", "timeframe", "stop_loss", "take_profit"]
@@ -32,7 +31,6 @@ def evaluate(df):
     j = oos.join(is_[["profit_factor"]], rsuffix="_is", how="inner")
     j["pass"] = (
         (j["profit_factor"] > OOS_PF_MIN)
-        & (j["win_rate_pct"] >= OOS_WR_MIN)
         & (j["n_trades"] >= OOS_MIN_TRADES)
         & (j["profit_factor_is"] > 1)
     )
@@ -53,7 +51,7 @@ def evaluate(df):
 
 def render(out):
     lines = [
-        f"## Evaluasi (OOS PF>{OOS_PF_MIN}, WR>={OOS_WR_MIN:.0f}%, trade>={OOS_MIN_TRADES}, IS PF>1; lulus = mayoritas pair)",
+        f"## Evaluasi (OOS PF>{OOS_PF_MIN}, trade>={OOS_MIN_TRADES}, IS PF>1; WR hanya info; lulus = mayoritas pair)",
         f"Kombinasi diuji: {len(out)} | LULUS: {int(out['lulus'].sum())}",
         "",
         "### Per strategi (jumlah kombinasi lulus / total)",

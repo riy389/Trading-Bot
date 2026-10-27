@@ -76,6 +76,9 @@ BOS_PIVOT = 5          # swing high/low = ekstrem dalam +-5 candle
 CONF_SL_MULT = 2.0     # SL awal = 2 x ATR
 TRAIL_ATR_MULT = 2.0   # jarak trailing = 2 x ATR
 
+RSI_PULLBACK_LONG, RSI_PULLBACK_SHORT = 45, 55   # pullback selesai: RSI naik lewat 45 (long) / turun lewat 55 (short)
+UNIFIED_TIMEFRAMES = ["4h"]                      # timeframe untuk strategi Unified
+
 # Mode arah: nama -> boleh short?
 MODES = {"long_only": False, "long_short": True}
 
@@ -476,6 +479,26 @@ def run_regime_switch(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None
     return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
 
 
+def run_unified(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
+    """Satu strategi trend pullback. Long: EMA21>EMA55, ADX>ADX_TREND_THRESHOLD, dan RSI
+    baru naik melewati RSI_PULLBACK_LONG. Short kebalikannya. Filter EMA200 + BOS
+    dipasang lewat filt (searah sinyal)."""
+    fast, slow = df["ema_fast"].to_numpy(), df["ema_slow"].to_numpy()
+    rsi, adx = df["rsi"].to_numpy(), df["adx"].to_numpy()
+
+    def get_signal(i, position):
+        a, r, p = adx[i], rsi[i], rsi[i - 1]
+        if not a > ADX_TREND_THRESHOLD:
+            return None
+        if fast[i] > slow[i] and p <= RSI_PULLBACK_LONG < r:
+            return "long"
+        if fast[i] < slow[i] and p >= RSI_PULLBACK_SHORT > r:
+            return "short"
+        return None
+
+    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
+
+
 def make_confluence_filter(df):
     close = df["close"].to_numpy()
     ema_trend = df["ema_trend"].to_numpy()
@@ -600,19 +623,16 @@ def main():
                         raw_trades[key % "meanrev"] = mr_trades
                         raw_trades[key % "regimeswitch"] = rs_trades
 
-            # Konfluensi: sinyal strategi + filter EMA200 & BOS searah, exit trailing SL
-            conf_filt = make_confluence_filter(df)
-            conf_sl, conf_tp = f"ATRx{CONF_SL_MULT:g}", f"trail{TRAIL_ATR_MULT:g}"
-            for mode, allow_short in MODES.items():
-                for name, tag, run in (
-                    ("TrendFollowing_EMA21_55_Conf", "trend", run_trend_following),
-                    ("MeanReversion_RSI14_Conf", "meanrev", run_mean_reversion),
-                    ("RegimeSwitch_ADX_Conf", "regimeswitch", run_regime_switch),
-                ):
-                    trades = run(df, CONF_SL_MULT, None, allow_short, TRAIL_ATR_MULT, conf_filt)
+            # Strategi tunggal (trend pullback): EMA stack + ADX + RSI pullback,
+            # filter EMA200 & BOS searah, exit trailing SL
+            if tf in UNIFIED_TIMEFRAMES:
+                conf_filt = make_confluence_filter(df)
+                conf_sl, conf_tp = f"ATRx{CONF_SL_MULT:g}", f"trail{TRAIL_ATR_MULT:g}"
+                for mode, allow_short in MODES.items():
+                    trades = run_unified(df, CONF_SL_MULT, None, allow_short, TRAIL_ATR_MULT, conf_filt)
                     for period, tr in split_by_period(trades, split_ts).items():
-                        all_results.append(compute_metrics(tr, name, symbol, tf, conf_sl, conf_tp, period, mode))
-                    raw_trades[f"{symbol}_{tf}_{tag}_sl{conf_sl}_tp{conf_tp}_{mode}"] = trades
+                        all_results.append(compute_metrics(tr, "Unified_TrendPullback", symbol, tf, conf_sl, conf_tp, period, mode))
+                    raw_trades[f"{symbol}_{tf}_unified_sl{conf_sl}_tp{conf_tp}_{mode}"] = trades
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
