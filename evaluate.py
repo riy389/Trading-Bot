@@ -69,9 +69,26 @@ def render(out):
     return "\n".join(lines)
 
 
+def mtf_report(df):
+    d = df[(df["period"] == "OOS") & df["strategy"].str.startswith("MTF_") & (df["n_trades"] > 0)].copy()
+    if d.empty:
+        return ""
+    d["w"] = d["win_rate_pct"] * d["n_trades"]
+    t = d.groupby(["strategy", "timeframe", "mode", "take_profit"]).agg(
+        pairs=("symbol", "count"), n_oos=("n_trades", "sum"),
+        pairs_profit=("total_return_pct", lambda x: int((x > 0).sum())),
+        med_pf=("profit_factor", "median"), avg_ret=("total_return_pct", "mean"),
+        med_dd=("max_drawdown_pct", "median"), w=("w", "sum"),
+    ).reset_index()
+    t["wr_info"] = t["w"] / t["n_oos"]
+    t = t.drop(columns="w")
+    return "\n### MTF per kondisi pasar (OOS, WR hanya info)\n```\n" + t.round(2).to_string(index=False) + "\n```"
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else CSV
-    text = render(evaluate(load(path)))
+    df = load(path)
+    text = render(evaluate(df)) + mtf_report(df)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

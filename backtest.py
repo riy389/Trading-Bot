@@ -570,6 +570,259 @@ def split_by_period(trades, split_ts):
     return {"full": trades, "IS": is_trades, "OOS": oos_trades}
 
 
+# ============== MULTI-TIMEFRAME: market reader 1h/4h + entry 5m/15m ==============
+MTF_ENTRY_TFS = ["15m", "5m"]          # timeframe entry (1m dan 30m sengaja tidak dipakai)
+MTF_DAYS = {"15m": DAYS_BACK, "5m": 365}   # 5m cukup 1 tahun (datanya sangat banyak)
+MTF_ANCHOR = "BTC/USDT:USDT"   # jangkar pasar: tidak long kalau bias BTC 4h turun
+MTF_SL_ATR = 2.0               # SL = 2 x ATR 1h (ATR 15m terlalu sempit dibanding biaya)
+MTF_TP_R = [2.0, 3.0, 3.5]     # variasi TP (kelipatan R)
+MTF_BE_R = 1.0                 # profit 1R -> SL pindah ke impas (entry + biaya)
+MTF_MAX_HOURS = 8              # time-stop (jam)
+MIN_SL_PCT = 0.0               # filter jarak SL minimum (0 = mati; fokus strategi/regime, bukan fee)
+COST_VERSIONS = {"net": (ROUND_TRIP_FEE, SLIPPAGE), "gross": (0.0, 0.0)}   # net = ala Bitget, gross = tanpa biaya
+MTF_RSI_LONG, MTF_RSI_SHORT = 45, 55   # pullback selesai (playbook tren)
+STOCH_LOW, STOCH_HIGH = 20, 80         # playbook range (gaya Strategy002)
+FT_SL_PCT = 0.10               # pembanding gaya freqtrade (Strategy001): SL tetap -10%
+FT_ROI = [(0, 0.05), (20, 0.04), (30, 0.03), (60, 0.01)]   # (menit, profit minimum)
+
+
+def _add_range_indicators(df):
+    ll = df["low"].rolling(5).min()
+    hh = df["high"].rolling(5).max()
+    fastk = 100 * (df["close"] - ll) / (hh - ll).replace(0, np.nan)
+    df["stoch_k"] = fastk.rolling(3).mean()
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    mid, sd = tp.rolling(20).mean(), tp.rolling(20).std()
+    df["bb_lower"] = mid - 2 * sd
+    df["bb_upper"] = mid + 2 * sd
+
+
+def _htf_asof(m, htf, tf, cols, etf):
+    """Ambil kolom HTF untuk tiap candle 15m TANPA lookahead: hanya candle HTF yang
+    sudah CLOSE pada close candle entry tsb (ts + durasi <= close candle 15m)."""
+    h = htf[["ts"] + cols].copy()
+    h["avail"] = h["ts"] + pd.Timedelta(tf)
+    h = h.drop(columns="ts").sort_values("avail")
+    left = m[["ts"]].copy()
+    left["avail"] = left["ts"] + pd.Timedelta(etf)
+    out = pd.merge_asof(left, h, on="avail", direction="backward")
+    out = out.drop(columns=["ts", "avail"])
+    out.index = m.index
+    return out
+
+
+def read_market(m, h1, h4, btc4, etf):
+    """Market reader. Kondisi per candle entry:
+    TREND_UP   : bias 4h naik (close>EMA200), EMA21>EMA55 di 1h, ADX 1h > batas trend
+    TREND_DOWN : kebalikannya
+    RANGE      : ADX 1h < batas range
+    NONE       : sisanya (transisi) -> tidak trade"""
+    m = m.copy()
+    _add_range_indicators(m)
+    h4 = h4.copy()
+    h4["h4_bias"] = np.sign(h4["close"] - h4["ema_trend"]).fillna(0)
+    a = _htf_asof(m, h1, "1h", ["atr", "adx", "ema_fast", "ema_slow"], etf).add_prefix("h1_")
+    b = _htf_asof(m, h4, "4h", ["h4_bias"], etf)
+    c = _htf_asof(m, btc4, "4h", ["h4_bias"], etf).rename(columns={"h4_bias": "btc_bias"})
+    m = pd.concat([m, a, b, c], axis=1)
+    m["atr"] = m["h1_atr"]   # jarak SL memakai ATR 1h
+    up = (m["h4_bias"] == 1) & (m["h1_ema_fast"] > m["h1_ema_slow"]) & (m["h1_adx"] > ADX_TREND_THRESHOLD)
+    dn = (m["h4_bias"] == -1) & (m["h1_ema_fast"] < m["h1_ema_slow"]) & (m["h1_adx"] > ADX_TREND_THRESHOLD)
+    rg = m["h1_adx"] < ADX_RANGE_THRESHOLD
+    m["regime"] = np.select([up, dn, rg], ["TREND_UP", "TREND_DOWN", "RANGE"], default="NONE")
+    return m
+
+
+def make_mtf_signal(m):
+    """Entry (5m/15m) sesuai kondisi pasar. TREND: RSI pullback selesai searah tren.
+    RANGE: reversal (RSI, Stoch, Bollinger) gaya Strategy002. Hanya jika jarak SL >= MIN_SL_PCT
+    dan bias BTC tidak berlawanan."""
+    c = m["close"].to_numpy()
+    rsi = m["rsi"].to_numpy()
+    prev = np.r_[np.nan, rsi[:-1]]
+    f, s = m["ema_fast"].to_numpy(), m["ema_slow"].to_numpy()
+    reg = m["regime"].to_numpy()
+    stk, bbl, bbu = m["stoch_k"].to_numpy(), m["bb_lower"].to_numpy(), m["bb_upper"].to_numpy()
+
+    def event(x):
+        return x & ~np.r_[False, x[:-1]]
+
+    t_long = (reg == "TREND_UP") & (f > s) & (prev <= MTF_RSI_LONG) & (rsi > MTF_RSI_LONG)
+    t_short = (reg == "TREND_DOWN") & (f < s) & (prev >= MTF_RSI_SHORT) & (rsi < MTF_RSI_SHORT)
+    r_long = event((reg == "RANGE") & (rsi < RSI_OVERSOLD) & (stk < STOCH_LOW) & (c < bbl))
+    r_short = event((reg == "RANGE") & (rsi > RSI_OVERBOUGHT) & (stk > STOCH_HIGH) & (c > bbu))
+    vol_ok = MTF_SL_ATR * m["atr"].to_numpy() / c >= MIN_SL_PCT
+    btc = m["btc_bias"].to_numpy()
+    long_sig = (t_long | r_long) & vol_ok & (btc != -1)
+    short_sig = (t_short | r_short) & vol_ok & (btc != 1)
+
+    def get_signal(i, position):
+        if position is not None:
+            return None
+        if long_sig[i]:
+            return "long"
+        if short_sig[i]:
+            return "short"
+        return None
+
+    return get_signal
+
+
+def _open_mtf(side, ts, open_, sl_dist, tp_r, i0):
+    sign = 1 if side == "long" else -1
+    entry_price = open_ * (1 + sign * SLIPPAGE)
+    return {
+        "side": side, "entry_ts": ts, "entry_price": entry_price,
+        "sl_price": entry_price - sign * sl_dist,
+        "tp_price": entry_price + sign * tp_r * sl_dist if tp_r else None,
+        "size": min(MAX_LEVERAGE, RISK_PER_TRADE / (sl_dist / entry_price)),
+        "r_dist": sl_dist, "i0": i0, "be_done": False,
+    }
+
+
+def _break_even(position, be_r, high, low):
+    """Profit mencapai be_r x R -> SL pindah ke impas (entry + fee + slippage)."""
+    if position["be_done"]:
+        return
+    e, d = position["entry_price"], position["r_dist"]
+    if position["side"] == "long":
+        if high >= e + be_r * d:
+            position["sl_price"] = max(position["sl_price"], e * (1 + ROUND_TRIP_FEE) / (1 - SLIPPAGE))
+            position["be_done"] = True
+    elif low <= e - be_r * d:
+        position["sl_price"] = min(position["sl_price"], e * (1 - ROUND_TRIP_FEE) / (1 + SLIPPAGE))
+        position["be_done"] = True
+
+
+def _roi_fill(position, cfg, i, open_, high, low):
+    """Gaya freqtrade minimal_roi: target profit menurun seiring umur trade (menit)."""
+    age = (i - position["i0"]) * cfg["bar_min"]
+    roi = None
+    for minutes, r in cfg["roi"]:
+        if age >= minutes:
+            roi = r
+    if roi is None:
+        return None
+    e = position["entry_price"]
+    if position["side"] == "long":
+        target = e * (1 + roi)
+        return (max(open_, target), "roi") if high >= target else None
+    target = e * (1 - roi)
+    return (min(open_, target), "roi") if low <= target else None
+
+
+def _simulate_mtf(df, get_signal, allow_short, cfg):
+    """Loop eksekusi. Aksi di open candle berikutnya (sama seperti _simulate).
+    Exit: SL / TP / break-even / time-stop (cfg 'ATR') atau SL tetap % + ROI table (cfg 'FT')."""
+    opens = df["open"].to_numpy()
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+    atrs = df["atr"].to_numpy()
+    tss = df["ts"].tolist()
+    trades, position, pending, pending_atr = [], None, None, None
+    for i in range(1, len(df)):
+        if pending is not None:
+            if position is None and (pending == "long" or (pending == "short" and allow_short)):
+                sl_dist = cfg["sl_pct"] * opens[i] if cfg["sl_pct"] else cfg["sl_atr"] * pending_atr
+                if sl_dist > 0:
+                    position = _open_mtf(pending, tss[i], opens[i], sl_dist, cfg["tp_r"], i)
+            pending = None
+
+        if position is not None and cfg["max_bars"] and i - position["i0"] >= cfg["max_bars"]:
+            trades.append(_close_position(position, tss[i], opens[i], "time_stop"))
+            position = None
+
+        if position is not None:
+            hit = _exit_fill(position, opens[i], highs[i], lows[i])
+            if hit is None and cfg["roi"]:
+                hit = _roi_fill(position, cfg, i, opens[i], highs[i], lows[i])
+            if hit is not None:
+                trades.append(_close_position(position, tss[i], hit[0], hit[1]))
+                position = None
+            elif cfg["be_r"]:
+                _break_even(position, cfg["be_r"], highs[i], lows[i])
+
+        pending = get_signal(i, position)
+        pending_atr = atrs[i]
+    return trades
+
+
+def run_mtf(exchange, all_results, raw_trades):
+    """Jalankan MTF dalam dua versi biaya: net (ala Bitget: sudah dipotong fee + slippage,
+    profit baru muncul setelah lewat BEP) dan gross (tanpa biaya). Selisihnya menunjukkan
+    apakah masalahnya strategi/regime atau biaya."""
+    global ROUND_TRIP_FEE, SLIPPAGE
+    orig = (ROUND_TRIP_FEE, SLIPPAGE)
+    try:
+        for version, (fee, slip) in COST_VERSIONS.items():
+            ROUND_TRIP_FEE, SLIPPAGE = fee, slip
+            print(f"\n##### MTF versi biaya: {version} (fee={fee}, slippage={slip}) #####")
+            _run_mtf_once(exchange, all_results, raw_trades, version)
+    finally:
+        ROUND_TRIP_FEE, SLIPPAGE = orig
+
+
+def _run_mtf_once(exchange, all_results, raw_trades, version):
+    """Jalankan market reader + entry per timeframe di MTF_ENTRY_TFS. Hasil dicatat per kondisi
+    pasar (strategi MTF_<model>_<ALL|TREND_UP|TREND_DOWN|RANGE>), model ATR (SL ATR 1h, BE 1R,
+    TP 2/3/3.5R, time-stop 8 jam) dan FT (pembanding gaya freqtrade)."""
+    suffix = "" if version == "net" else "_gross"
+    def load(symbol, tf, days):
+        d = fetch_ohlcv_cached(exchange, symbol, tf, days)
+        if d is None or len(d) < 100:
+            print(f"  [!] Data {symbol} {tf} tidak cukup, MTF skip.")
+            return None
+        if any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(d, tf)):
+            print(f"  [!] Gap besar di {symbol} {tf}, MTF skip.")
+            return None
+        return add_indicators(d)
+
+    btc = load(MTF_ANCHOR, "4h", DAYS_BACK)
+    if btc is None:
+        print("[!] Data BTC 4h tidak ada, MTF dilewati.")
+        return
+    btc4 = btc[["ts"]].copy()
+    btc4["h4_bias"] = np.sign(btc["close"] - btc["ema_trend"]).fillna(0)
+
+    for etf in MTF_ENTRY_TFS:
+        bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
+        max_bars = MTF_MAX_HOURS * 60 // bar_min
+        models = [
+            ("ATR", f"ATR1hx{MTF_SL_ATR:g}", f"BE{MTF_BE_R:g}R_TP{tp:g}R_{MTF_MAX_HOURS}h",
+             {"sl_atr": MTF_SL_ATR, "sl_pct": None, "tp_r": tp, "be_r": MTF_BE_R,
+              "max_bars": max_bars, "roi": None, "bar_min": bar_min})
+            for tp in MTF_TP_R
+        ]
+        models.append(("FT", f"FT-{FT_SL_PCT:.0%}", "ROI-table",
+                       {"sl_atr": None, "sl_pct": FT_SL_PCT, "tp_r": None, "be_r": None,
+                        "max_bars": None, "roi": FT_ROI, "bar_min": bar_min}))
+
+        for symbol in PAIRS:
+            print(f"\n=== MTF {symbol} ({etf} entry, 1h/4h reader) ===")
+            m = load(symbol, etf, MTF_DAYS.get(etf, DAYS_BACK))
+            h1, h4 = load(symbol, "1h", DAYS_BACK), load(symbol, "4h", DAYS_BACK)
+            if m is None or h1 is None or h4 is None:
+                continue
+            m = read_market(m, h1, h4, btc4, etf)
+            print("  kondisi:", m["regime"].value_counts(normalize=True).round(2).to_dict())
+            split_ts = m["ts"].iloc[0] + (m["ts"].iloc[-1] - m["ts"].iloc[0]) / 2
+            reg_map = dict(zip(m["ts"], m["regime"]))
+            get_signal = make_mtf_signal(m)
+            for mode, allow_short in MODES.items():
+                for model, sl_label, tp_label, cfg in models:
+                    trades = _simulate_mtf(m, get_signal, allow_short, cfg)
+                    for t in trades:
+                        sig_ts = pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf)
+                        t["regime"] = reg_map.get(sig_ts, "NONE")
+                    for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
+                        sub = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
+                        for period, tr in split_by_period(sub, split_ts).items():
+                            all_results.append(compute_metrics(
+                                tr, f"MTF_{model}_{label}{suffix}", symbol, etf, sl_label, tp_label, period, mode))
+                    if version == "net" and (model == "FT" or tp_label.startswith("BE1R_TP3R")):   # simpan trade mentah model utama saja
+                        raw_trades[f"{symbol}_{etf}_mtf_{model}_{tp_label}_{mode}"] = trades
+
+
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
@@ -633,6 +886,8 @@ def main():
                     for period, tr in split_by_period(trades, split_ts).items():
                         all_results.append(compute_metrics(tr, "Unified_TrendPullback", symbol, tf, conf_sl, conf_tp, period, mode))
                     raw_trades[f"{symbol}_{tf}_unified_sl{conf_sl}_tp{conf_tp}_{mode}"] = trades
+
+    run_mtf(exchange, all_results, raw_trades)
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
