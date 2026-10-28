@@ -92,7 +92,7 @@ OUTPUT_CSV = "results_summary.csv"
 # ===========================================
 
 
-def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None):
+def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None, until_ms=None):
     """Ambil OHLCV lengkap dengan pagination, karena CCXT membatasi per-call.
     Berhenti hanya saat data sudah mencapai waktu sekarang, bukan saat satu
     call mengembalikan kurang dari `limit` candle (Bitget bisa saja balas
@@ -100,7 +100,7 @@ def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None):
     since = since_ms if since_ms is not None else exchange.parse8601(
         (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
-    now_ms = exchange.milliseconds()
+    now_ms = until_ms if until_ms is not None else exchange.milliseconds()
     all_candles = []
     # Bitget history-candles: maks 200 candle per call. Kalau limit lebih besar,
     # window (limit x timeframe) tetap dicakup tapi hanya 200 candle TERAKHIR
@@ -161,7 +161,15 @@ def fetch_ohlcv_cached(exchange, symbol, timeframe, days_back):
         if len(cached):
             since_ms = int(cached["ts"].iloc[-1].timestamp() * 1000)
     new = fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms)
-    parts = [d for d in (cached, new) if d is not None and len(d)]
+    old = None
+    first_cached = cached["ts"].iloc[0] if cached is not None and len(cached) else None
+    want = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days_back)
+    if first_cached is not None and first_cached > want + pd.Timedelta(days=2):
+        # cache lebih pendek dari yang diminta: tarik data lama (backfill) sampai awal cache
+        print(f"  [backfill] cache mulai {first_cached}, ambil sejak {want}")
+        old = fetch_ohlcv(exchange, symbol, timeframe, days_back, int(want.timestamp() * 1000),
+                          until_ms=int(first_cached.timestamp() * 1000))
+    parts = [d for d in (old, cached, new) if d is not None and len(d)]
     if not parts:
         return None
     df = pd.concat(parts).drop_duplicates(subset="ts", keep="last").sort_values("ts")
@@ -572,12 +580,12 @@ def split_by_period(trades, split_ts):
 
 # ============== MULTI-TIMEFRAME: market reader 1h/4h + entry 5m/15m ==============
 MTF_ENTRY_TFS = ["15m", "5m"]          # timeframe entry (1m dan 30m sengaja tidak dipakai)
-MTF_DAYS = {"15m": DAYS_BACK, "5m": 365}   # 5m cukup 1 tahun (datanya sangat banyak)
+MTF_DAYS = {"15m": DAYS_BACK, "5m": DAYS_BACK}   # 5m dan 15m sama-sama 2 tahun
 MTF_ANCHOR = "BTC/USDT:USDT"   # jangkar pasar: tidak long kalau bias BTC 4h turun
 MTF_SL_ATR = 2.0               # SL = 2 x ATR 1h (ATR 15m terlalu sempit dibanding biaya)
-MTF_TP_R = [2.0, 3.0, 3.5]     # variasi TP (kelipatan R)
+MTF_TP_R = [1.5, 2.0]     # variasi TP (kelipatan R)
 MTF_BE_R = 1.0                 # profit 1R -> SL pindah ke impas (entry + biaya)
-MTF_MAX_HOURS = 8              # time-stop (jam)
+MTF_MAX_HOURS = 24              # time-stop (jam)
 MIN_SL_PCT = 0.0               # filter jarak SL minimum (0 = mati; fokus strategi/regime, bukan fee)
 COST_VERSIONS = {"net": (ROUND_TRIP_FEE, SLIPPAGE), "gross": (0.0, 0.0)}   # net = ala Bitget, gross = tanpa biaya
 MTF_RSI_LONG, MTF_RSI_SHORT = 45, 55   # pullback selesai (playbook tren)
@@ -877,22 +885,28 @@ def freqtrade_batch_signals(m):
 
 
 def run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix):
-    """Jalankan Strategy003/004/005 (entry + exit signal exit_profit_only + ROI table + SL -10%)
-    dan catat hasil per kondisi pasar: strategi FTS_<nama>_<ALL|TREND_UP|TREND_DOWN|RANGE>."""
+    """Entry + exit signal Strategy003/004/005 dibungkus manajemen risiko yang sama dengan model ATR
+    (SL 2xATR 1h, TP 1.5R/2R, BE 1R, time-stop 24 jam). Hasil per kondisi pasar:
+    FTS_<nama>_<ALL|TREND_UP|TREND_DOWN|RANGE>. ROI table dan SL -10% aslinya tidak dipakai."""
     bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
-    for name, (entry, exit_sig, roi) in freqtrade_batch_signals(m).items():
+    max_bars = MTF_MAX_HOURS * 60 // bar_min
+    for name, (entry, exit_sig, _roi) in freqtrade_batch_signals(m).items():
         def get_signal(i, position, entry=entry):
             return "long" if position is None and entry[i] else None
-        cfg = {"sl_atr": None, "sl_pct": FT_SL_PCT, "tp_r": None, "be_r": None, "max_bars": None,
-               "roi": roi, "bar_min": bar_min, "exit_sig": exit_sig, "exit_profit_only": True}
-        trades = _simulate_mtf(m, get_signal, False, cfg)
-        for t in trades:
-            t["regime"] = reg_map.get(pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf), "NONE")
-        for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
-            sub = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
-            for period, tr in split_by_period(sub, split_ts).items():
-                all_results.append(compute_metrics(
-                    tr, f"FTS_{name}_{label}{suffix}", symbol, etf, f"FT-{FT_SL_PCT:.0%}", "ROI+exit", period, "long_only"))
+        for tp in MTF_TP_R:
+            cfg = {"sl_atr": MTF_SL_ATR, "sl_pct": None, "tp_r": tp, "be_r": MTF_BE_R,
+                   "max_bars": max_bars, "roi": None, "bar_min": bar_min,
+                   "exit_sig": exit_sig, "exit_profit_only": True}
+            trades = _simulate_mtf(m, get_signal, False, cfg)
+            for t in trades:
+                t["regime"] = reg_map.get(pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf), "NONE")
+            tp_label = f"BE{MTF_BE_R:g}R_TP{tp:g}R_{MTF_MAX_HOURS}h"
+            for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
+                sub_t = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
+                for period, tr in split_by_period(sub_t, split_ts).items():
+                    all_results.append(compute_metrics(
+                        tr, f"FTS_{name}_{label}{suffix}", symbol, etf,
+                        f"ATR1hx{MTF_SL_ATR:g}", tp_label, period, "long_only"))
 
 
 def run_mtf(exchange, all_results, raw_trades):
@@ -913,7 +927,7 @@ def run_mtf(exchange, all_results, raw_trades):
 def _run_mtf_once(exchange, all_results, raw_trades, version):
     """Jalankan market reader + entry per timeframe di MTF_ENTRY_TFS. Hasil dicatat per kondisi
     pasar (strategi MTF_<model>_<ALL|TREND_UP|TREND_DOWN|RANGE>), model ATR (SL ATR 1h, BE 1R,
-    TP 2/3/3.5R, time-stop 8 jam) dan FT (pembanding gaya freqtrade)."""
+    TP 1.5/2R, time-stop 24 jam) dan FT (pembanding gaya freqtrade)."""
     suffix = "" if version == "net" else "_gross"
     def load(symbol, tf, days):
         d = fetch_ohlcv_cached(exchange, symbol, tf, days)
@@ -943,7 +957,7 @@ def _run_mtf_once(exchange, all_results, raw_trades, version):
         ]
         models.append(("FT", f"FT-{FT_SL_PCT:.0%}", "ROI-table",
                        {"sl_atr": None, "sl_pct": FT_SL_PCT, "tp_r": None, "be_r": None,
-                        "max_bars": None, "roi": FT_ROI, "bar_min": bar_min}))
+                        "max_bars": max_bars, "roi": FT_ROI, "bar_min": bar_min}))
 
         for symbol in PAIRS:
             print(f"\n=== MTF {symbol} ({etf} entry, 1h/4h reader) ===")
@@ -971,7 +985,7 @@ def _run_mtf_once(exchange, all_results, raw_trades, version):
                         for period, tr in split_by_period(sub, split_ts).items():
                             all_results.append(compute_metrics(
                                 tr, f"MTF_{model}_{label}{suffix}", symbol, etf, sl_label, tp_label, period, mode))
-                    if version == "net" and (model == "FT" or tp_label.startswith("BE1R_TP3R")):   # simpan trade mentah model utama saja
+                    if version == "net" and (model == "FT" or tp_label.startswith("BE1R_TP2R")):   # simpan trade mentah model utama saja
                         raw_trades[f"{symbol}_{etf}_mtf_{model}_{tp_label}_{mode}"] = trades
 
 
