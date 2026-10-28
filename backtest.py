@@ -586,6 +586,36 @@ FT_SL_PCT = 0.10               # pembanding gaya freqtrade (Strategy001): SL tet
 FT_ROI = [(0, 0.05), (20, 0.04), (30, 0.03), (60, 0.01)]   # (menit, profit minimum)
 
 
+REGIME_FWD_HOURS = [1, 4]
+OUTPUT_REGIME_CSV = "regime_forward.csv"
+REGIME_ROWS = []
+
+
+def regime_forward_rows(m, symbol, etf, split_ts):
+    """Uji label regime saja: return ke depan (open candle i+1 -> close candle i+H) per
+    kondisi, sampel tak tumpang-tindih. Tanpa entry/SL/TP/biaya."""
+    bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
+    o, c = m["open"].to_numpy(), m["close"].to_numpy()
+    reg, ts = m["regime"].to_numpy(), m["ts"]
+    rows = []
+    for hours in REGIME_FWD_HOURS:
+        H = hours * 60 // bar_min
+        idx = np.arange(0, len(m) - H, H)
+        fwd = c[idx + H] / o[idx + 1] - 1
+        oos = (ts.iloc[idx] >= split_ts).to_numpy()
+        for period, pm in (("IS", ~oos), ("OOS", oos)):
+            for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
+                sel = pm if label == "ALL" else pm & (reg[idx] == label)
+                f = fwd[sel]
+                rows.append({
+                    "symbol": symbol, "timeframe": etf, "horizon_h": hours, "period": period,
+                    "regime": label, "n": int(len(f)),
+                    "mean_fwd_pct": round(float(f.mean() * 100), 4) if len(f) else np.nan,
+                    "mean_abs_pct": round(float(np.abs(f).mean() * 100), 4) if len(f) else np.nan,
+                })
+    return rows
+
+
 def _add_range_indicators(df):
     ll = df["low"].rolling(5).min()
     hh = df["high"].rolling(5).max()
@@ -806,6 +836,8 @@ def _run_mtf_once(exchange, all_results, raw_trades, version):
             m = read_market(m, h1, h4, btc4, etf)
             print("  kondisi:", m["regime"].value_counts(normalize=True).round(2).to_dict())
             split_ts = m["ts"].iloc[0] + (m["ts"].iloc[-1] - m["ts"].iloc[0]) / 2
+            if version == "net":
+                REGIME_ROWS.extend(regime_forward_rows(m, symbol, etf, split_ts))
             reg_map = dict(zip(m["ts"], m["regime"]))
             get_signal = make_mtf_signal(m)
             for mode, allow_short in MODES.items():
@@ -888,6 +920,8 @@ def main():
                     raw_trades[f"{symbol}_{tf}_unified_sl{conf_sl}_tp{conf_tp}_{mode}"] = trades
 
     run_mtf(exchange, all_results, raw_trades)
+    if REGIME_ROWS:
+        pd.DataFrame(REGIME_ROWS).to_csv(OUTPUT_REGIME_CSV, index=False)
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")

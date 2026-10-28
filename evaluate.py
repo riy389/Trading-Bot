@@ -85,10 +85,29 @@ def mtf_report(df):
     return "\n### MTF per kondisi pasar (OOS, WR hanya info)\n```\n" + t.round(2).to_string(index=False) + "\n```"
 
 
+def regime_report(path="regime_forward.csv"):
+    if not os.path.exists(path):
+        return ""
+    r = pd.read_csv(path)
+    key = ["symbol", "timeframe", "horizon_h", "period"]
+    base = r[r["regime"] == "ALL"].set_index(key)[["mean_fwd_pct", "mean_abs_pct"]]
+    r = r[(r["regime"] != "ALL") & (r["n"] > 0)].join(base, on=key, rsuffix="_all")
+    sign = r["regime"].map({"TREND_UP": 1, "TREND_DOWN": -1})
+    r["edge"] = np.where(r["regime"] == "RANGE",
+                         r["mean_abs_pct_all"] - r["mean_abs_pct"],
+                         sign * (r["mean_fwd_pct"] - r["mean_fwd_pct_all"]))
+    t = r.groupby(["timeframe", "horizon_h", "regime", "period"]).agg(
+        pairs=("symbol", "count"), n=("n", "sum"), avg_fwd=("mean_fwd_pct", "mean"),
+        avg_edge=("edge", "mean"), pairs_ok=("edge", lambda x: int((x > 0).sum())),
+    ).reset_index()
+    return ("\n### Tes label regime (return ke depan; edge>0 = label benar; lulus: OOS avg_edge>0 dan pairs_ok>=7)\n```\n"
+            + t.round(4).to_string(index=False) + "\n```")
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else CSV
     df = load(path)
-    text = render(evaluate(df)) + mtf_report(df)
+    text = render(evaluate(df)) + mtf_report(df) + regime_report()
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
