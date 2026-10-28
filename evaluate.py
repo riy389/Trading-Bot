@@ -74,14 +74,19 @@ def mtf_report(df):
     if d.empty:
         return ""
     d["w"] = d["win_rate_pct"] * d["n_trades"]
+    d["wtp"] = d["tp_hit_rate_pct"] * d["n_trades"]
+    d["wsl"] = d["sl_hit_rate_pct"] * d["n_trades"]
     t = d.groupby(["strategy", "timeframe", "mode", "take_profit"]).agg(
         pairs=("symbol", "count"), n_oos=("n_trades", "sum"),
         pairs_profit=("total_return_pct", lambda x: int((x > 0).sum())),
         med_pf=("profit_factor", "median"), avg_ret=("total_return_pct", "mean"),
         med_dd=("max_drawdown_pct", "median"), w=("w", "sum"),
+        wtp=("wtp", "sum"), wsl=("wsl", "sum"),
     ).reset_index()
     t["wr_info"] = t["w"] / t["n_oos"]
-    t = t.drop(columns="w")
+    t["tp_hit"] = t["wtp"] / t["n_oos"]   # % trade keluar kena TP
+    t["sl_hit"] = t["wsl"] / t["n_oos"]   # % trade keluar kena SL (termasuk SL yang sudah geser ke impas)
+    t = t.drop(columns=["w", "wtp", "wsl"])
     return "\n### MTF per kondisi pasar (OOS, WR hanya info)\n```\n" + t.round(2).to_string(index=False) + "\n```"
 
 
