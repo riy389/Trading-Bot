@@ -70,7 +70,7 @@ def render(out):
 
 
 def mtf_report(df):
-    d = df[(df["period"] == "OOS") & df["strategy"].str.startswith("MTF_") & (df["n_trades"] > 0)].copy()
+    d = df[(df["period"] == "OOS") & df["strategy"].str.startswith(("MTF_", "FTS_")) & (df["n_trades"] > 0)].copy()
     if d.empty:
         return ""
     d["w"] = d["win_rate_pct"] * d["n_trades"]

@@ -762,6 +762,13 @@ def _simulate_mtf(df, get_signal, allow_short, cfg):
             trades.append(_close_position(position, tss[i], opens[i], "time_stop"))
             position = None
 
+        sig = cfg.get("exit_sig")
+        if position is not None and sig is not None and position["i0"] < i and sig[i - 1]:
+            if not cfg.get("exit_profit_only") or (
+                    (opens[i] * (1 - SLIPPAGE) - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE > 0):
+                trades.append(_close_position(position, tss[i], opens[i], "exit_signal"))
+                position = None
+
         if position is not None:
             hit = _exit_fill(position, opens[i], highs[i], lows[i])
             if hit is None and cfg["roi"]:
@@ -775,6 +782,117 @@ def _simulate_mtf(df, get_signal, allow_short, cfg):
         pending = get_signal(i, position)
         pending_atr = atrs[i]
     return trades
+
+
+FTS_TF = "5m"   # Strategy003/004/005 dirancang untuk 5m
+FTS_ROI_3_4 = [(0, 0.05), (20, 0.04), (30, 0.03), (60, 0.01)]
+FTS_ROI_5 = [(0, 0.05), (20, 0.04), (40, 0.03), (80, 0.02), (1440, 0.01)]
+
+
+def _stochf(d, n):
+    ll, hh = d["low"].rolling(n).min(), d["high"].rolling(n).max()
+    k = 100 * (d["close"] - ll) / (hh - ll).replace(0, np.nan)
+    return k, k.rolling(3).mean()
+
+
+def _crossed_above(a, b):
+    b0 = b.shift(1) if hasattr(b, "shift") else b
+    return (a > b) & (a.shift(1) <= b0)
+
+
+def _sar(high, low, af0=0.02, af_max=0.2):
+    """Parabolic SAR (Wilder), pengganti ta.SAR."""
+    n = len(high)
+    out = np.full(n, np.nan)
+    if n < 3:
+        return out
+    long = high[1] >= high[0]
+    ep = high[1] if long else low[1]
+    s = low[0] if long else high[0]
+    af = af0
+    for i in range(2, n):
+        s = s + af * (ep - s)
+        if long:
+            s = min(s, low[i - 1], low[i - 2])
+            if low[i] < s:
+                long, s, ep, af = False, ep, low[i], af0
+            elif high[i] > ep:
+                ep, af = high[i], min(af + af0, af_max)
+        else:
+            s = max(s, high[i - 1], high[i - 2])
+            if high[i] > s:
+                long, s, ep, af = True, ep, high[i], af0
+            elif low[i] < ep:
+                ep, af = low[i], min(af + af0, af_max)
+        out[i] = s
+    return out
+
+
+def freqtrade_batch_signals(m):
+    """Port Strategy003/004/005 (freqtrade-strategies, long-only, 5m).
+    Return {nama: (entry, exit, roi)}. Strategy005 memakai buy/sell_params dari file-nya."""
+    c, h, l, v, rsi = m["close"], m["high"], m["low"], m["volume"], m["rsi"]
+    ema = lambda n: c.ewm(span=n, adjust=False).mean()
+    arr = lambda s: s.to_numpy(dtype=bool)
+    fisher = np.tanh(0.1 * (rsi - 50))
+    sma40 = c.rolling(40).mean()
+    sar = pd.Series(_sar(h.to_numpy(), l.to_numpy()), index=m.index)
+    fastk, fastd = _stochf(m, 5)
+    tp = (h + l + c) / 3
+    dtp, mf = tp.diff(), tp * v
+    pos = mf.where(dtp > 0, 0.0).rolling(14).sum()
+    neg = mf.where(dtp < 0, 0.0).rolling(14).sum()
+    mfi = 100 * pos / (pos + neg).replace(0, np.nan)
+
+    e3 = ((rsi < 28) & (rsi > 0) & (c < sma40) & (fisher < -0.94) & (mfi < 16.0)
+          & ((ema(50) > ema(100)) | _crossed_above(ema(5), ema(10)))
+          & (fastd > fastk) & (fastd > 0))
+    x3 = (sar > c) & (fisher > 0.3)
+
+    slowadx = _compute_adx(m, 35)
+    cci = (tp - tp.rolling(14).mean()) / (0.015 * tp.rolling(14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True))
+    fk50, fd50 = _stochf(m, 50)
+    e4 = (((m["adx"] > 50) | (slowadx > 26)) & (cci < -100)
+          & (fastk.shift(1) < 20) & (fastd.shift(1) < 20)
+          & (fk50.shift(1) < 30) & (fd50.shift(1) < 30)
+          & (fastk.shift(1) < fastd.shift(1)) & (fastk > fastd)
+          & (v.rolling(12).mean() > 0.75))
+    x4 = (slowadx < 25) & ((fastk > 70) | (fastd > 70)) & (fastk.shift(1) < fastd.shift(1)) & (c > ema(5))
+
+    macd = ema(12) - ema(26)
+    up, dn = h.diff(), -l.diff()
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=m.index)
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    minus_di = 100 * mdm.ewm(alpha=1 / 14, adjust=False).mean() / tr.ewm(alpha=1 / 14, adjust=False).mean()
+    e5 = ((v > v.rolling(150).mean() * 4) & (c < sma40) & (fastd > fastk)
+          & (rsi > 26) & (fastd > 1) & (50 * (fisher + 1) < 5))
+    x5 = _crossed_above(rsi, 74) & (macd < 0) & (minus_di > 4)
+
+    return {
+        "Strategy003": (arr(e3), arr(x3), FTS_ROI_3_4),
+        "Strategy004": (arr(e4), arr(x4), FTS_ROI_3_4),
+        "Strategy005": (arr(e5), arr(x5), FTS_ROI_5),
+    }
+
+
+def run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix):
+    """Jalankan Strategy003/004/005 (entry + exit signal exit_profit_only + ROI table + SL -10%)
+    dan catat hasil per kondisi pasar: strategi FTS_<nama>_<ALL|TREND_UP|TREND_DOWN|RANGE>."""
+    bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
+    for name, (entry, exit_sig, roi) in freqtrade_batch_signals(m).items():
+        def get_signal(i, position, entry=entry):
+            return "long" if position is None and entry[i] else None
+        cfg = {"sl_atr": None, "sl_pct": FT_SL_PCT, "tp_r": None, "be_r": None, "max_bars": None,
+               "roi": roi, "bar_min": bar_min, "exit_sig": exit_sig, "exit_profit_only": True}
+        trades = _simulate_mtf(m, get_signal, False, cfg)
+        for t in trades:
+            t["regime"] = reg_map.get(pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf), "NONE")
+        for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
+            sub = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
+            for period, tr in split_by_period(sub, split_ts).items():
+                all_results.append(compute_metrics(
+                    tr, f"FTS_{name}_{label}{suffix}", symbol, etf, f"FT-{FT_SL_PCT:.0%}", "ROI+exit", period, "long_only"))
 
 
 def run_mtf(exchange, all_results, raw_trades):
@@ -840,6 +958,8 @@ def _run_mtf_once(exchange, all_results, raw_trades, version):
                 REGIME_ROWS.extend(regime_forward_rows(m, symbol, etf, split_ts))
             reg_map = dict(zip(m["ts"], m["regime"]))
             get_signal = make_mtf_signal(m)
+            if etf == FTS_TF:
+                run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix)
             for mode, allow_short in MODES.items():
                 for model, sl_label, tp_label, cfg in models:
                     trades = _simulate_mtf(m, get_signal, allow_short, cfg)
