@@ -28,12 +28,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 # ============== KONFIGURASI ==============
-PAIRS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-    "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
-    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
-    "LTC/USDT:USDT", "DOT/USDT:USDT", "TRX/USDT:USDT",
-]  # Bitget perpetual swap
+PAIRS = ["BTC/USDT:USDT"]  # Bitget perpetual swap (sementara 1 pair; 12 pair ada di git history)
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 DAYS_BACK = 365 * 2          # 2 tahun data
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
@@ -50,10 +45,13 @@ RISK_PER_TRADE = 0.01        # 1R = 1% ekuitas
 MIN_SL_PCT = 0.0             # jarak SL minimum (% harga); 0 = mati
 
 SESSIONS = ["24h", "free"]
+TP_R = 1.5                   # TP tetap = TP_R x 1R dari entry (gross)
+# varian exit: nama -> (pakai trailing UT, pakai TP tetap)
+VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, True)}
 SESSION_LAST_ENTRY_MIN = 22 * 60   # 22:00 UTC = 05:00 WIB, entry terakhir
 SESSION_CLOSE_MIN = 23 * 60        # 23:00 UTC = 06:00 WIB, tutup paksa
 
-MODES = {"long_only": False, "long_short": True}
+MODES = {"long_short": True}
 MAX_GAP_CANDLES = 3          # gap data lebih besar -> pair/timeframe di-skip
 
 CACHE_DIR = "cache"
@@ -249,7 +247,7 @@ def apply_costs(trades, cost):
     return out
 
 
-def simulate_ut(df, ut, session, allow_short):
+def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -279,27 +277,34 @@ def simulate_ut(df, ut, session, allow_short):
                       and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN))
                 if ok:
                     sl_pct = nl / e
-                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl,
+                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl, "tp": e + sign * TP_R * nl,
                            "sl_pct": sl_pct, "size": RISK_PER_TRADE / sl_pct, "day": day[i]}
             pending = None
 
-        # 3) SL tetap / trailing TP, dicek intrabar (termasuk candle entry)
+        # 3) SL tetap / trailing TP / TP tetap, dicek intrabar (termasuk candle entry)
+        #    SL dan TP tetap kena di candle yang sama -> SL dianggap duluan
         if pos is not None:
-            trail, sl = stop[i - 1], pos["sl"]
-            if pos["side"] == "long":
-                use_trail = trail > sl
-                lvl = trail if use_trail else sl
+            sign = 1 if pos["side"] == "long" else -1
+            sl = pos["sl"]
+            trail = stop[i - 1]
+            use_trail = trail_on and sign * (trail - sl) > 0
+            lvl = trail if use_trail else sl
+            if sign == 1:
                 fill = min(o[i], lvl) if l[i] <= lvl else None
             else:
-                use_trail = trail < sl
-                lvl = trail if use_trail else sl
                 fill = max(o[i], lvl) if h[i] >= lvl else None
+            reason = None
             if fill is not None:
-                sign = 1 if pos["side"] == "long" else -1
                 if not use_trail:
                     reason = "stop_loss"
                 else:
-                    reason = "take_profit" if sign * (fill - pos["entry"]) > 0 else "trail_loss"
+                    reason = "trail_win" if sign * (fill - pos["entry"]) > 0 else "trail_loss"
+            elif tp_on:
+                if sign == 1 and h[i] >= pos["tp"]:
+                    fill, reason = max(o[i], pos["tp"]), "tp_fixed"
+                elif sign == -1 and l[i] <= pos["tp"]:
+                    fill, reason = min(o[i], pos["tp"]), "tp_fixed"
+            if reason is not None:
                 trades.append(_close(pos, tss[i], fill, reason))
                 pos = None
 
@@ -309,6 +314,14 @@ def simulate_ut(df, ut, session, allow_short):
         elif sell[i]:
             pending = "short"
     return trades
+
+
+REASONS = {"stop_loss": "n_sl", "tp_fixed": "n_tp_fixed", "trail_win": "n_trail_win",
+           "trail_loss": "n_trail_loss", "session_end": "n_session", "reverse": "n_reverse"}
+
+
+def _reason_counts(trades):
+    return {col: sum(1 for t in trades if t["exit_reason"] == r) for r, col in REASONS.items()}
 
 
 def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label, period="full", mode="long_only"):
@@ -323,6 +336,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
             "profit_factor": None, "max_drawdown_pct": 0, "avg_pnl_pct": 0,
             "sl_hit_rate_pct": 0, "tp_hit_rate_pct": 0,
             "avg_gross_R": 0, "avg_fee_R": 0, "avg_net_R": 0, "avg_lev_x": 0, "max_lev_x": 0,
+            **_reason_counts(trades),
         }
 
     pnls = [t["pnl_pct"] for t in trades]
@@ -344,7 +358,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
     max_dd = ((equity - running_max) / running_max).min() * 100
 
     sl_hits = sum(1 for t in trades if t["exit_reason"] == "stop_loss")
-    tp_hits = sum(1 for t in trades if t["exit_reason"] == "take_profit")
+    tp_hits = sum(1 for t in trades if t["exit_reason"] in ("tp_fixed", "trail_win"))
     return {
         **base,
         "n_trades": n, "total_return_pct": round(total_return, 2),
@@ -359,6 +373,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
         "avg_net_R": round(float(np.mean([t["net_R"] for t in trades])), 3),
         "avg_lev_x": round(float(np.mean([t["size"] for t in trades])), 2),
         "max_lev_x": round(float(np.max([t["size"] for t in trades])), 2),
+        **_reason_counts(trades),
     }
 
 
@@ -390,13 +405,15 @@ def main():
             split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
             for session in SESSIONS:
                 for mode, allow_short in MODES.items():
-                    trades = simulate_ut(df, ut, session, allow_short)
-                    for cost_name, cost in COST_VERSIONS.items():
-                        suffix = "" if cost_name == "net" else "_gross"
-                        name = f"UT_a{UT_A:g}_c{UT_C}_{session}{suffix}"
-                        for period, tr in split_by_period(apply_costs(trades, cost), split_ts).items():
-                            all_results.append(compute_metrics(
-                                tr, name, symbol, tf, "SL1R_fixed", "trail_UT", period, mode))
+                    for vname, (trail_on, tp_on) in VARIANTS.items():
+                        trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on)
+                        tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "") if x)
+                        for cost_name, cost in COST_VERSIONS.items():
+                            suffix = "" if cost_name == "net" else "_gross"
+                            name = f"UT_a{UT_A:g}_c{UT_C}_{session}_{vname}{suffix}"
+                            for period, tr in split_by_period(apply_costs(trades, cost), split_ts).items():
+                                all_results.append(compute_metrics(
+                                    tr, name, symbol, tf, "SL1R_fixed", tp_label, period, mode))
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
