@@ -233,6 +233,7 @@ def _close(pos, ts, price, reason):
         "entry_price": pos["entry"], "exit_price": price,
         "sl_pct": pos["sl_pct"], "size": pos["size"],
         "gross_ret": gross_ret, "gross_R": gross_ret / pos["sl_pct"], "exit_reason": reason,
+        "mfe_R": pos["mfe"],
     }
 
 
@@ -277,7 +278,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
                       and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN))
                 if ok:
                     sl_pct = nl / e
-                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl, "tp": e + sign * TP_R * nl,
+                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl, "tp": e + sign * TP_R * nl, "mfe": 0.0,
                            "sl_pct": sl_pct, "size": RISK_PER_TRADE / sl_pct, "day": day[i]}
             pending = None
 
@@ -307,6 +308,9 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
             if reason is not None:
                 trades.append(_close(pos, tss[i], fill, reason))
                 pos = None
+            else:
+                ext = h[i] if sign == 1 else l[i]
+                pos["mfe"] = max(pos["mfe"], sign * (ext - pos["entry"]) / (pos["entry"] * pos["sl_pct"]))
 
         # 4) sinyal baru dari close candle ini
         if buy[i]:
@@ -321,7 +325,13 @@ REASONS = {"stop_loss": "n_sl", "tp_fixed": "n_tp_fixed", "trail_win": "n_trail_
 
 
 def _reason_counts(trades):
-    return {col: sum(1 for t in trades if t["exit_reason"] == r) for r, col in REASONS.items()}
+    out = {col: sum(1 for t in trades if t["exit_reason"] == r) for r, col in REASONS.items()}
+    # trade rugi (gross) yang sebelumnya sempat untung >= k R (MFE intrabar, candle exit tidak dihitung)
+    losers = [t for t in trades if t["gross_R"] < 0]
+    out["n_loss"] = len(losers)
+    for k, nm in ((0.5, "05"), (1.0, "10"), (1.5, "15")):
+        out["loss_mfe" + nm] = sum(1 for t in losers if t["mfe_R"] >= k)
+    return out
 
 
 def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label, period="full", mode="long_only"):

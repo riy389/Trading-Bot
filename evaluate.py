@@ -158,10 +158,27 @@ def ut_report(df):
             " sess=tutup paksa, rev=sinyal balik, wr=% trade untung\n```\n" + t.round(2).to_string(index=False) + "\n```")
 
 
+def mfe_report(df):
+    """Dari trade rugi (gross, varian trail), berapa yang sebelumnya sempat untung >= 0.5R / 1R / 1.5R."""
+    d = df[df["strategy"].str.startswith("UT_") & df["strategy"].str.endswith("_trail_gross") & (df["period"] == "full")]
+    if d.empty or "loss_mfe10" not in d.columns:
+        return ""
+    t = d[["strategy", "timeframe", "n_trades", "n_loss", "loss_mfe05", "loss_mfe10", "loss_mfe15"]].copy()
+    for c in ("05", "10", "15"):
+        t["pct" + c] = 100 * t["loss_mfe" + c] / t["n_loss"]
+    t["strategy"] = t["strategy"].str.replace(r"^UT_a[^_]+_c\d+_", "", regex=True).str.replace("_gross", "", regex=False)
+    t["timeframe"] = pd.Categorical(t["timeframe"], ["5m", "15m", "1h", "4h"], ordered=True)
+    t = t.sort_values(["strategy", "timeframe"]).rename(columns={
+        "n_trades": "n", "n_loss": "rugi", "loss_mfe05": "m05", "loss_mfe10": "m10", "loss_mfe15": "m15"})
+    return ("\n### Trade rugi yang sempat untung dulu (gross, trail). m05/m10/m15 = jumlah rugi yang pernah >= 0.5R/1R/1.5R,"
+            " pct = % dari rugi. Batas atas manfaat BEP, belum menghitung pemenang yang terpotong\n```\n"
+            + t.round(1).to_string(index=False) + "\n```")
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else CSV
     df = load(path)
-    text = render(evaluate(df)) + ut_report(df) + mtf_report(df) + regime_report() + excursion_report()
+    text = render(evaluate(df)) + ut_report(df) + mfe_report(df) + mtf_report(df) + regime_report() + excursion_report()
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
