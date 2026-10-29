@@ -1,35 +1,21 @@
 #!/usr/bin/env python3
 """
-Backtest engine sederhana: Trend-Following (EMA cross), Mean-Reversion (RSI)
-dan Regime-Switch (ADX memilih strategi mana yang aktif).
-Data asli dari Bitget via CCXT. Fee Bitget nyata, tanpa leverage.
+Backtest engine: UT Bot Alerts (TradingView, Pine v4) diport persis ke Python.
+Data asli dari Bitget via CCXT. Ukuran posisi dari risiko 1% ekuitas.
 
-Cara pakai:
-    pip install ccxt pandas numpy --break-system-packages
-    python3 backtest.py
+Tahap 1 = port persis (a=1, ATR 10, tanpa Heikin Ashi). Tuning baru setelah hasil dilihat.
 
-Edit PAIRS / TIMEFRAMES / DAYS_BACK di bawah untuk ubah cakupan uji.
-
-Asumsi eksekusi:
-- Sinyal dihitung dari close candle i. SEMUA aksi (entry, exit sinyal, reversal)
-  dieksekusi di OPEN candle i+1, bukan di close candle sinyal.
-- SEMUA posisi wajib punya stop-loss: jarak SL = SL_ATR_MULTS x ATR candle sinyal.
-  Take-profit (opsional) = TP_R_MULTS x jarak SL; None = tanpa TP (exit lewat
-  sinyal strategi). SL/TP dicek mulai candle entry. Kalau SL dan TP sama-sama
-  tersentuh di satu candle, SL dianggap kena duluan (konservatif). Kalau open
-  gap melewati SL, fill di open (lebih buruk dari harga SL); TP fill di harga TP.
-- Ukuran posisi: risiko RISK_PER_TRADE dari ekuitas per trade, maks MAX_LEVERAGE x
-  ekuitas. pnl_pct di hasil = persen terhadap EKUITAS (sudah dikali ukuran posisi,
-  setelah fee dan slippage).
-- Dua mode: long_only dan long_short (short saat sinyal berlawanan).
-  Funding rate perpetual TIDAK dimodelkan.
-- Hasil dilaporkan 3 periode: full, IS (paruh pertama), OOS (paruh kedua).
-  Trade dimasukkan ke IS/OOS berdasarkan waktu entry.
-- Regime-Switch: ADX>ADX_TREND_THRESHOLD pakai sinyal EMA cross (trend-following),
-  ADX<ADX_RANGE_THRESHOLD pakai sinyal RSI (mean-reversion), di antara keduanya
-  tidak ada entry baru. Posisi yang sudah terbuka ditutup PAKSA ("flat") begitu
-  regime jelas berbalik ke lawannya, supaya tidak nyangkut menunggu sinyal
-  strategi asal.
+Aturan eksekusi:
+- Sinyal (buy/sell UT) dihitung di CLOSE candle i, entry di OPEN candle i+1.
+- 1R = jarak SL = UT_A x ATR candle sinyal. Ukuran posisi = RISK_PER_TRADE / jarak SL (persen),
+  TANPA fee di dalamnya dan tanpa batas leverage, supaya rugi di SL selalu -1R (gross).
+- Exit hanya lewat SL tetap (1R) atau trailing TP (garis trailing stop UT dari candle
+  sebelumnya), dicek intrabar pakai low/high. Gap -> fill di open. Sinyal berlawanan saat posisi
+  masih hidup: tutup di open lalu buka arah baru.
+- Fee + slippage TIDAK ada di strategi: mesin memotongnya saat trade ditutup
+  (net_R = gross_R - fee_R). Versi 'net' (0.22%) dan 'gross' (0) dijalankan keduanya.
+- Dua sesi: '24h' (entry 07:00-05:00 WIB, tutup paksa 06:00 WIB) dan 'free' (tanpa batas waktu).
+- Funding rate tidak dimodelkan.
 """
 
 import ccxt
@@ -38,6 +24,7 @@ import numpy as np
 import os
 import time
 import json
+import math
 from datetime import datetime, timedelta, timezone
 
 # ============== KONFIGURASI ==============
@@ -47,50 +34,32 @@ PAIRS = [
     "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
     "LTC/USDT:USDT", "DOT/USDT:USDT", "TRX/USDT:USDT",
 ]  # Bitget perpetual swap
-TIMEFRAMES = ["1h", "4h"]
+TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 DAYS_BACK = 365 * 2          # 2 tahun data
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
 ROUND_TRIP_FEE = TAKER_FEE * 2
-SLIPPAGE = 0.0005             # 0.05% asumsi slippage per sisi, konservatif
+SLIPPAGE = 0.0005            # 0.05% per sisi
+COST_VERSIONS = {"net": ROUND_TRIP_FEE + 2 * SLIPPAGE, "gross": 0.0}   # % dari nilai posisi
 
-# Parameter strategi
-EMA_FAST, EMA_SLOW = 21, 55
-RSI_PERIOD = 14
-RSI_OVERSOLD, RSI_OVERBOUGHT, RSI_EXIT = 30, 70, 50
+# UT Bot Alerts (default TradingView)
+UT_A = 1                     # Key Value (sensitivitas)
+UT_C = 10                    # ATR period
+UT_HA = False                # sinyal dari close Heikin Ashi
 
-# Parameter ADX (regime filter)
-ADX_PERIOD = 14
-ADX_TREND_THRESHOLD = 25   # ADX > ini -> regime trending, pakai EMA cross
-ADX_RANGE_THRESHOLD = 20   # ADX < ini -> regime ranging, pakai RSI mean-reversion
+RISK_PER_TRADE = 0.01        # 1R = 1% ekuitas
+MIN_SL_PCT = 0.0             # jarak SL minimum (% harga); 0 = mati
 
-# Manajemen risiko (SL wajib, tidak ada opsi tanpa SL)
-ATR_PERIOD = 14
-SL_ATR_MULTS = [1.5, 2.0, 3.0]       # jarak SL = mult x ATR saat sinyal
-TP_R_MULTS = [None, 0.5, 1.0, 2.0]   # TP = R x jarak SL; None = tanpa TP
-RISK_PER_TRADE = 0.01                # risiko 1% ekuitas per trade
-MAX_LEVERAGE = 1.0                   # ukuran posisi maks = 1x ekuitas (tanpa leverage)
+SESSIONS = ["24h", "free"]
+SESSION_LAST_ENTRY_MIN = 22 * 60   # 22:00 UTC = 05:00 WIB, entry terakhir
+SESSION_CLOSE_MIN = 23 * 60        # 23:00 UTC = 06:00 WIB, tutup paksa
 
-# Konfluensi (filter searah sinyal strategi) + trailing SL
-EMA_TREND = 200        # long hanya kalau close > EMA200, short kalau close < EMA200
-BOS_PIVOT = 5          # swing high/low = ekstrem dalam +-5 candle
-CONF_SL_MULT = 2.0     # SL awal = 2 x ATR
-TRAIL_ATR_MULT = 2.0   # jarak trailing = 2 x ATR
-
-RSI_PULLBACK_LONG, RSI_PULLBACK_SHORT = 45, 55   # pullback selesai: RSI naik lewat 45 (long) / turun lewat 55 (short)
-UNIFIED_TIMEFRAMES = ["4h"]                      # timeframe untuk strategi Unified
-
-# Mode arah: nama -> boleh short?
 MODES = {"long_only": False, "long_short": True}
+MAX_GAP_CANDLES = 3          # gap data lebih besar -> pair/timeframe di-skip
 
-# Validasi data: gap lebih dari ini (dalam jumlah candle hilang) -> pair/timeframe di-skip
-# supaya SL tidak disimulasikan melewati data yang hilang. Gap kecil ditoleransi.
-MAX_GAP_CANDLES = 3
-
-CACHE_DIR = "cache"          # cache candle per pair/timeframe (CSV)
+CACHE_DIR = "cache"
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
 # ===========================================
-
 
 def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None, until_ms=None):
     """Ambil OHLCV lengkap dengan pagination, karena CCXT membatasi per-call.
@@ -193,331 +162,153 @@ def find_ohlcv_gaps(df, timeframe):
     return gaps
 
 
-def add_indicators(df):
-    df = df.copy()
-    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+# ---------- UT Bot Alerts (port persis dari Pine v4) ----------
 
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    df["adx"] = _compute_adx(df, ADX_PERIOD)
-
-    prev_close = df["close"].shift(1)
-    true_range = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = true_range.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
-    df["ema_trend"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean().where(df.index >= EMA_TREND)
-    df["bos"] = _compute_bos(df, BOS_PIVOT)
-    return df
+def _rma_atr(high, low, close, length):
+    """atr() Pine v4 = RMA(TR, length), seed = SMA(TR) di bar ke-length."""
+    n = len(high)
+    tr = np.empty(n)
+    tr[0] = high[0] - low[0]
+    tr[1:] = np.maximum.reduce([
+        high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])])
+    out = np.full(n, np.nan)
+    if n >= length:
+        out[length - 1] = tr[:length].mean()
+        for i in range(length, n):
+            out[i] = (out[i - 1] * (length - 1) + tr[i]) / length
+    return out
 
 
-def _compute_bos(df, n):
-    # Arah struktur: +1 setelah close tembus swing high terakhir, -1 setelah tembus
-    # swing low terakhir. Swing baru dikonfirmasi n candle kemudian (tanpa lookahead).
-    h, l, c = df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy()
-    state = np.zeros(len(df))
-    last_sh = last_sl = np.nan
-    cur = 0
-    for i in range(len(df)):
-        j = i - n
-        if j >= n:
-            if h[j] == h[j - n:i + 1].max():
-                last_sh = h[j]
-            if l[j] == l[j - n:i + 1].min():
-                last_sl = l[j]
-        if c[i] > last_sh:
-            cur = 1
-        elif c[i] < last_sl:
-            cur = -1
-        state[i] = cur
-    return state
+def ut_bot(df, a=UT_A, c=UT_C, ha=UT_HA):
+    """Return (stop, buy, sell, nloss), array per candle (dihitung di close candle).
+    stop = xATRTrailingStop. buy/sell = alertcondition 'UT Long'/'UT Short'.
+    ha=True: src = close Heikin Ashi (o+h+l+c)/4; ATR tetap dari candle biasa."""
+    o, h, l, cl = (df[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
+    src = (o + h + l + cl) / 4 if ha else cl
+    nloss = a * _rma_atr(h, l, cl, c)
+    n = len(src)
+    stop = np.full(n, np.nan)
+    prev = float("nan")
+    for i in range(n):
+        nl = nloss[i]
+        p = 0.0 if math.isnan(prev) else prev            # nz(stop[1], 0)
+        s = src[i]
+        s1 = src[i - 1] if i > 0 else float("nan")
+        if math.isnan(nl):
+            cur = float("nan")                            # max/min dengan na = na
+        elif s > p and s1 > p:
+            cur = max(p, s - nl)
+        elif s < p and s1 < p:
+            cur = min(p, s + nl)
+        elif s > p:
+            cur = s - nl
+        else:
+            cur = s + nl
+        stop[i] = cur
+        prev = cur
+    stop1 = np.r_[np.nan, stop[:-1]]
+    src1 = np.r_[np.nan, src[:-1]]
+    ema = src                                             # ema(src, 1) == src
+    ema1 = np.r_[np.nan, ema[:-1]]
+    with np.errstate(invalid="ignore"):
+        above = (ema > stop) & (ema1 <= stop1)            # crossover(ema, stop)
+        below = (stop > ema) & (stop1 <= ema1)            # crossover(stop, ema)
+        buy = (src > stop) & above
+        sell = (src < stop) & below
+    return stop, buy, sell, nloss
 
 
-def _compute_adx(df, period):
-    """ADX klasik (Wilder smoothing) dari high/low/close."""
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    prev_high = high.shift(1)
-    prev_low = low.shift(1)
+# ---------- Eksekusi: SL tetap 1R + trailing TP (garis UT), biaya dipotong di luar strategi ----------
 
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-
-    up_move = high - prev_high
-    down_move = prev_low - low
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return adx
+def _time_arrays(df):
+    ts = df["ts"]
+    tod = (ts.dt.hour * 60 + ts.dt.minute).to_numpy()
+    day = ((ts - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(days=1)).to_numpy()
+    return tod, day
 
 
-def _open_position(side, ts, open_, atr, sl_mult, tp_r, trail_mult=None):
-    """Buka posisi di open candle. Slippage selalu merugikan. SL = sl_mult x ATR,
-    TP = tp_r x jarak SL (atau None). Ukuran posisi = risiko 1% ekuitas / jarak SL,
-    maks MAX_LEVERAGE. Return None kalau ATR tidak valid."""
-    if not atr > 0:
-        return None
-    sign = 1 if side == "long" else -1
-    entry_price = open_ * (1 + sign * SLIPPAGE)
-    sl_dist = sl_mult * atr
+def _close(pos, ts, price, reason):
+    sign = 1 if pos["side"] == "long" else -1
+    gross_ret = sign * (price - pos["entry"]) / pos["entry"]
     return {
-        "side": side, "entry_ts": ts, "entry_price": entry_price,
-        "sl_price": entry_price - sign * sl_dist,
-        "tp_price": entry_price + sign * tp_r * sl_dist if tp_r else None,
-        "size": min(MAX_LEVERAGE, RISK_PER_TRADE / (sl_dist / entry_price)),
-        "extreme": entry_price,
-        "trail_dist": trail_mult * atr if trail_mult else None,
+        "side": pos["side"], "entry_ts": str(pos["ts"]), "exit_ts": str(ts),
+        "entry_price": pos["entry"], "exit_price": price,
+        "sl_pct": pos["sl_pct"], "size": pos["size"],
+        "gross_ret": gross_ret, "gross_R": gross_ret / pos["sl_pct"], "exit_reason": reason,
     }
 
 
-def _exit_fill(position, open_, high, low):
-    """(harga fill mentah sebelum slippage, alasan) kalau SL/TP tersentuh di candle
-    ini, selain itu None. SL dicek duluan (konservatif kalau keduanya tersentuh).
-    Kalau open gap melewati SL, fill di open. TP fill di harga TP."""
-    sl, tp = position["sl_price"], position["tp_price"]
-    if position["side"] == "long":
-        if low <= sl:
-            return min(open_, sl), "stop_loss"
-        if tp is not None and high >= tp:
-            return tp, "take_profit"
-    else:
-        if high >= sl:
-            return max(open_, sl), "stop_loss"
-        if tp is not None and low <= tp:
-            return tp, "take_profit"
-    return None
+def apply_costs(trades, cost):
+    """Biaya (fee + slippage, % dari nilai posisi) dipotong saat trade ditutup, di luar strategi.
+    pnl_pct = persen ekuitas; fee_R = biaya dalam kelipatan R; net_R = gross_R - fee_R."""
+    out = []
+    for t in trades:
+        fee_r = cost / t["sl_pct"]
+        out.append({**t, "fee_R": fee_r, "net_R": t["gross_R"] - fee_r,
+                    "pnl_pct": t["size"] * (t["gross_ret"] - cost)})
+    return out
 
 
-def _trail_stop(position, high, low):
-    """SL hanya bergerak ke arah profit (long naik, short turun), tidak pernah mundur."""
-    if position["side"] == "long":
-        position["extreme"] = max(position["extreme"], high)
-        position["sl_price"] = max(position["sl_price"], position["extreme"] - position["trail_dist"])
-    else:
-        position["extreme"] = min(position["extreme"], low)
-        position["sl_price"] = min(position["sl_price"], position["extreme"] + position["trail_dist"])
-
-
-def _close_position(position, ts, raw_exit_price, reason):
-    if position["side"] == "long":
-        exit_price = raw_exit_price * (1 - SLIPPAGE)
-        gross = (exit_price - position["entry_price"]) / position["entry_price"]
-    else:
-        exit_price = raw_exit_price * (1 + SLIPPAGE)
-        gross = (position["entry_price"] - exit_price) / position["entry_price"]
-    return {
-        "side": position["side"],
-        "entry_ts": str(position["entry_ts"]), "exit_ts": str(ts),
-        "entry_price": position["entry_price"], "exit_price": exit_price,
-        "size": position["size"],
-        "pnl_pct": (gross - ROUND_TRIP_FEE) * position["size"], "exit_reason": reason,
-        "mfe_r": position.get("mfe_r", 0.0), "mae_r": position.get("mae_r", 0.0),
-    }
-
-
-def _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult=None, filt=None):
-    """Loop eksekusi bersama untuk semua strategi.
-    get_signal(i, position) dipanggil di close candle i dan mengembalikan target
-    untuk dieksekusi di open candle i+1: "long", "short", "flat", atau None.
-    "short" saat allow_short=False hanya menutup long (tidak membuka short)."""
-    opens = df["open"].to_numpy()
-    highs = df["high"].to_numpy()
-    lows = df["low"].to_numpy()
-    atrs = df["atr"].to_numpy()
+def simulate_ut(df, ut, session, allow_short):
+    """Sinyal di close candle i-1 dieksekusi di open candle i.
+    Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
+    sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
+    saat posisi masih hidup: tutup di open lalu buka arah baru (kalau diizinkan).
+    session '24h': entry hanya sampai 22:00 UTC (05:00 WIB), tutup paksa 23:00 UTC (06:00 WIB)."""
+    o, h, l = (df[k].to_numpy(dtype=float) for k in ("open", "high", "low"))
+    stop, buy, sell, nloss = ut
+    tod, day = _time_arrays(df)
     tss = df["ts"].tolist()
-
-    trades = []
-    position = None
-    pending = None
-    pending_atr = None
+    trades, pos, pending = [], None, None
     for i in range(1, len(df)):
-        # 1) Eksekusi sinyal dari candle sebelumnya di open candle ini
+        # 1) tutup paksa akhir sesi
+        if pos is not None and session == "24h" and (day[i] > pos["day"] or tod[i] >= SESSION_CLOSE_MIN):
+            trades.append(_close(pos, tss[i], o[i], "session_end"))
+            pos = None
+
+        # 2) eksekusi sinyal candle sebelumnya di open candle ini
         if pending is not None:
-            if position is not None and position["side"] != pending:
-                trades.append(_close_position(position, tss[i], opens[i], "signal"))
-                position = None
-            if position is None and (pending == "long" or (pending == "short" and allow_short)):
-                position = _open_position(pending, tss[i], opens[i], pending_atr, sl_mult, tp_r, trail_mult)
+            if pos is not None and pos["side"] != pending:
+                trades.append(_close(pos, tss[i], o[i], "reverse"))
+                pos = None
+            if pos is None and (pending == "long" or allow_short):
+                nl, tr_sig, e = nloss[i - 1], stop[i - 1], o[i]
+                sign = 1 if pending == "long" else -1
+                ok = (nl > 0 and nl / e >= MIN_SL_PCT and not math.isnan(tr_sig)
+                      and sign * (e - tr_sig) > 0                    # open belum melewati garis UT
+                      and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN))
+                if ok:
+                    sl_pct = nl / e
+                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl,
+                           "sl_pct": sl_pct, "size": RISK_PER_TRADE / sl_pct, "day": day[i]}
             pending = None
 
-        # 2) Cek stop-loss / take-profit dalam candle ini (termasuk candle entry)
-        if position is not None:
-            hit = _exit_fill(position, opens[i], highs[i], lows[i])
-            if hit is not None:
-                trades.append(_close_position(position, tss[i], hit[0], hit[1]))
-                position = None
-            elif position["trail_dist"]:
-                _trail_stop(position, highs[i], lows[i])
+        # 3) SL tetap / trailing TP, dicek intrabar (termasuk candle entry)
+        if pos is not None:
+            trail, sl = stop[i - 1], pos["sl"]
+            if pos["side"] == "long":
+                use_trail = trail > sl
+                lvl = trail if use_trail else sl
+                fill = min(o[i], lvl) if l[i] <= lvl else None
+            else:
+                use_trail = trail < sl
+                lvl = trail if use_trail else sl
+                fill = max(o[i], lvl) if h[i] >= lvl else None
+            if fill is not None:
+                sign = 1 if pos["side"] == "long" else -1
+                if not use_trail:
+                    reason = "stop_loss"
+                else:
+                    reason = "take_profit" if sign * (fill - pos["entry"]) > 0 else "trail_loss"
+                trades.append(_close(pos, tss[i], fill, reason))
+                pos = None
 
-        # 3) Sinyal baru dari close candle ini (ATR candle ini dipakai untuk SL/TP)
-        pending = get_signal(i, position)
-        if trail_mult:
-            # mode konfluensi: sinyal hanya untuk ENTRY (exit lewat trailing SL),
-            # dan hanya kalau filter EMA200 + BOS searah dengan sinyal
-            if position is not None or pending not in ("long", "short") or not filt(i, pending):
-                pending = None
-        pending_atr = atrs[i]
+        # 4) sinyal baru dari close candle ini
+        if buy[i]:
+            pending = "long"
+        elif sell[i]:
+            pending = "short"
     return trades
-
-
-def run_trend_following(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
-    """EMA cross: fast cross up slow -> long, cross down -> short (atau hanya
-    tutup long kalau allow_short=False). Selalu reversal saat sinyal berlawanan."""
-    fast = df["ema_fast"].to_numpy()
-    slow = df["ema_slow"].to_numpy()
-
-    def get_signal(i, position):
-        if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
-            return "long"
-        if fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
-            return "short"
-        return None
-
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
-
-
-def run_mean_reversion(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
-    """RSI: cross di bawah 30 -> long, keluar saat cross di atas 50.
-    Kalau allow_short: cross di atas 70 -> short, keluar saat cross di bawah 50."""
-    rsi = df["rsi"].to_numpy()
-
-    def get_signal(i, position):
-        r, p = rsi[i], rsi[i - 1]
-        if np.isnan(r) or np.isnan(p):
-            return None
-        side = position["side"] if position is not None else None
-        if side == "long" and p <= RSI_EXIT < r:
-            return "flat"
-        if side == "short" and p >= RSI_EXIT > r:
-            return "flat"
-        if p >= RSI_OVERSOLD and r < RSI_OVERSOLD:
-            return "long"
-        if p <= RSI_OVERBOUGHT and r > RSI_OVERBOUGHT:
-            return "short"
-        return None
-
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
-
-
-def run_regime_switch(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
-    """ADX menentukan strategi mana yang aktif di candle ini:
-    - ADX > ADX_TREND_THRESHOLD -> sinyal EMA cross (trend-following)
-    - ADX < ADX_RANGE_THRESHOLD -> sinyal RSI (mean-reversion)
-    - di antara keduanya -> tidak ada entry baru (posisi existing tetap exit normal)
-    Exit mengikuti logika strategi yang membuka posisi tsb (EMA reversal untuk
-    posisi trend, RSI=50 cross untuk posisi mean-reversion), DITAMBAH exit paksa
-    kalau regime sudah jelas berbalik total (posisi trend ditutup segera saat
-    ADX turun di bawah ADX_RANGE_THRESHOLD; posisi meanrev ditutup segera saat
-    ADX naik di atas ADX_TREND_THRESHOLD). SL/TP berlaku sama untuk kedua kaki."""
-    fast = df["ema_fast"].to_numpy()
-    slow = df["ema_slow"].to_numpy()
-    rsi = df["rsi"].to_numpy()
-    adx = df["adx"].to_numpy()
-
-    # Lacak strategi mana yang membuka posisi saat ini, supaya exit pakai logika yang sama
-    open_by = {"strategy": None}
-
-    def get_signal(i, position):
-        a = adx[i]
-        if position is not None:
-            # exit paksa kalau regime sudah jelas berbalik ke lawannya
-            if open_by["strategy"] == "trend" and not np.isnan(a) and a < ADX_RANGE_THRESHOLD:
-                return "flat"
-            if open_by["strategy"] == "meanrev" and not np.isnan(a) and a > ADX_TREND_THRESHOLD:
-                return "flat"
-
-            # selain itu, exit mengikuti logika strategi yang membukanya
-            if open_by["strategy"] == "trend":
-                if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
-                    return "long"
-                if fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
-                    return "short"
-                return None
-            if open_by["strategy"] == "meanrev":
-                r, p = rsi[i], rsi[i - 1]
-                if np.isnan(r) or np.isnan(p):
-                    return None
-                side = position["side"]
-                if side == "long" and p <= RSI_EXIT < r:
-                    return "flat"
-                if side == "short" and p >= RSI_EXIT > r:
-                    return "flat"
-                return None
-            return None
-
-        # tidak ada posisi -> entry baru hanya kalau regime jelas (trending/ranging)
-        if np.isnan(a):
-            return None
-        if a > ADX_TREND_THRESHOLD:
-            if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
-                open_by["strategy"] = "trend"
-                return "long"
-            if fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]:
-                open_by["strategy"] = "trend"
-                return "short"
-        elif a < ADX_RANGE_THRESHOLD:
-            r, p = rsi[i], rsi[i - 1]
-            if np.isnan(r) or np.isnan(p):
-                return None
-            if p >= RSI_OVERSOLD and r < RSI_OVERSOLD:
-                open_by["strategy"] = "meanrev"
-                return "long"
-            if p <= RSI_OVERBOUGHT and r > RSI_OVERBOUGHT:
-                open_by["strategy"] = "meanrev"
-                return "short"
-        return None
-
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
-
-
-def run_unified(df, sl_mult, tp_r=None, allow_short=False, trail_mult=None, filt=None):
-    """Satu strategi trend pullback. Long: EMA21>EMA55, ADX>ADX_TREND_THRESHOLD, dan RSI
-    baru naik melewati RSI_PULLBACK_LONG. Short kebalikannya. Filter EMA200 + BOS
-    dipasang lewat filt (searah sinyal)."""
-    fast, slow = df["ema_fast"].to_numpy(), df["ema_slow"].to_numpy()
-    rsi, adx = df["rsi"].to_numpy(), df["adx"].to_numpy()
-
-    def get_signal(i, position):
-        a, r, p = adx[i], rsi[i], rsi[i - 1]
-        if not a > ADX_TREND_THRESHOLD:
-            return None
-        if fast[i] > slow[i] and p <= RSI_PULLBACK_LONG < r:
-            return "long"
-        if fast[i] < slow[i] and p >= RSI_PULLBACK_SHORT > r:
-            return "short"
-        return None
-
-    return _simulate(df, sl_mult, tp_r, allow_short, get_signal, trail_mult, filt)
-
-
-def make_confluence_filter(df):
-    close = df["close"].to_numpy()
-    ema_trend = df["ema_trend"].to_numpy()
-    bos = df["bos"].to_numpy()
-
-    def filt(i, side):
-        s = 1 if side == "long" else -1
-        return (close[i] - ema_trend[i]) * s > 0 and bos[i] == s
-
-    return filt
 
 
 def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label, period="full", mode="long_only"):
@@ -531,6 +322,7 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
             "n_trades": 0, "total_return_pct": 0, "win_rate_pct": 0,
             "profit_factor": None, "max_drawdown_pct": 0, "avg_pnl_pct": 0,
             "sl_hit_rate_pct": 0, "tp_hit_rate_pct": 0,
+            "avg_gross_R": 0, "avg_fee_R": 0, "avg_net_R": 0, "avg_lev_x": 0, "max_lev_x": 0,
         }
 
     pnls = [t["pnl_pct"] for t in trades]
@@ -543,22 +335,16 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
     gross_loss = abs(sum(losses))
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0)
 
-    # compound equity curve utk total return & max drawdown
     equity = [1.0]
     for p in pnls:
         equity.append(equity[-1] * (1 + p))
     equity = np.array(equity)
     total_return = (equity[-1] - 1) * 100
-
     running_max = np.maximum.accumulate(equity)
-    drawdown = (equity - running_max) / running_max
-    max_dd = drawdown.min() * 100
+    max_dd = ((equity - running_max) / running_max).min() * 100
 
-    sl_hits = sum(1 for t in trades if t.get("exit_reason") == "stop_loss")
-    sl_hit_rate = sl_hits / n * 100
-    tp_hits = sum(1 for t in trades if t.get("exit_reason") == "take_profit")
-    tp_hit_rate = tp_hits / n * 100
-
+    sl_hits = sum(1 for t in trades if t["exit_reason"] == "stop_loss")
+    tp_hits = sum(1 for t in trades if t["exit_reason"] == "take_profit")
     return {
         **base,
         "n_trades": n, "total_return_pct": round(total_return, 2),
@@ -566,8 +352,13 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else "inf",
         "max_drawdown_pct": round(max_dd, 2),
         "avg_pnl_pct": round(np.mean(pnls) * 100, 3),
-        "sl_hit_rate_pct": round(sl_hit_rate, 1),
-        "tp_hit_rate_pct": round(tp_hit_rate, 1),
+        "sl_hit_rate_pct": round(sl_hits / n * 100, 1),
+        "tp_hit_rate_pct": round(tp_hits / n * 100, 1),
+        "avg_gross_R": round(float(np.mean([t["gross_R"] for t in trades])), 3),
+        "avg_fee_R": round(float(np.mean([t["fee_R"] for t in trades])), 3),
+        "avg_net_R": round(float(np.mean([t["net_R"] for t in trades])), 3),
+        "avg_lev_x": round(float(np.mean([t["size"] for t in trades])), 2),
+        "max_lev_x": round(float(np.max([t["size"] for t in trades])), 2),
     }
 
 
@@ -578,564 +369,44 @@ def split_by_period(trades, split_ts):
     oos_trades = [t for t in trades if t["entry_ts"] >= split]
     return {"full": trades, "IS": is_trades, "OOS": oos_trades}
 
-
-# ============== MULTI-TIMEFRAME: market reader 1h/4h + entry 5m/15m ==============
-MTF_ENTRY_TFS = ["15m", "5m"]          # timeframe entry (1m dan 30m sengaja tidak dipakai)
-MTF_DAYS = {"15m": DAYS_BACK, "5m": DAYS_BACK}   # 5m dan 15m sama-sama 2 tahun
-MTF_ANCHOR = "BTC/USDT:USDT"   # jangkar pasar: tidak long kalau bias BTC 4h turun
-MTF_SL_ATR = 2.0               # SL = 2 x ATR 1h (ATR 15m terlalu sempit dibanding biaya)
-MTF_TP_R = [1.5, 2.0]     # variasi TP (kelipatan R)
-MTF_BE_R = 1.0                 # profit 1R -> SL pindah ke impas (entry + biaya)
-MTF_MAX_HOURS = 24              # time-stop (jam)
-MIN_SL_PCT = 0.0               # filter jarak SL minimum (0 = mati; fokus strategi/regime, bukan fee)
-COST_VERSIONS = {"net": (ROUND_TRIP_FEE, SLIPPAGE), "gross": (0.0, 0.0)}   # net = ala Bitget, gross = tanpa biaya
-MTF_RSI_LONG, MTF_RSI_SHORT = 45, 55   # pullback selesai (playbook tren)
-STOCH_LOW, STOCH_HIGH = 20, 80         # playbook range (gaya Strategy002)
-FT_SL_PCT = 0.10               # pembanding gaya freqtrade (Strategy001): SL tetap -10%
-FT_ROI = [(0, 0.05), (20, 0.04), (30, 0.03), (60, 0.01)]   # (menit, profit minimum)
-
-
-REGIME_FWD_HOURS = [1, 4]
-OUTPUT_REGIME_CSV = "regime_forward.csv"
-REGIME_ROWS = []
-
-
-def regime_forward_rows(m, symbol, etf, split_ts):
-    """Uji label regime saja: return ke depan (open candle i+1 -> close candle i+H) per
-    kondisi, sampel tak tumpang-tindih. Tanpa entry/SL/TP/biaya."""
-    bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
-    o, c = m["open"].to_numpy(), m["close"].to_numpy()
-    reg, ts = m["regime"].to_numpy(), m["ts"]
-    rows = []
-    for hours in REGIME_FWD_HOURS:
-        H = hours * 60 // bar_min
-        idx = np.arange(0, len(m) - H, H)
-        fwd = c[idx + H] / o[idx + 1] - 1
-        oos = (ts.iloc[idx] >= split_ts).to_numpy()
-        for period, pm in (("IS", ~oos), ("OOS", oos)):
-            for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
-                sel = pm if label == "ALL" else pm & (reg[idx] == label)
-                f = fwd[sel]
-                rows.append({
-                    "symbol": symbol, "timeframe": etf, "horizon_h": hours, "period": period,
-                    "regime": label, "n": int(len(f)),
-                    "mean_fwd_pct": round(float(f.mean() * 100), 4) if len(f) else np.nan,
-                    "mean_abs_pct": round(float(np.abs(f).mean() * 100), 4) if len(f) else np.nan,
-                })
-    return rows
-
-
-def _add_range_indicators(df):
-    ll = df["low"].rolling(5).min()
-    hh = df["high"].rolling(5).max()
-    fastk = 100 * (df["close"] - ll) / (hh - ll).replace(0, np.nan)
-    df["stoch_k"] = fastk.rolling(3).mean()
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    mid, sd = tp.rolling(20).mean(), tp.rolling(20).std()
-    df["bb_lower"] = mid - 2 * sd
-    df["bb_upper"] = mid + 2 * sd
-
-
-def _htf_asof(m, htf, tf, cols, etf):
-    """Ambil kolom HTF untuk tiap candle 15m TANPA lookahead: hanya candle HTF yang
-    sudah CLOSE pada close candle entry tsb (ts + durasi <= close candle 15m)."""
-    h = htf[["ts"] + cols].copy()
-    h["avail"] = h["ts"] + pd.Timedelta(tf)
-    h = h.drop(columns="ts").sort_values("avail")
-    left = m[["ts"]].copy()
-    left["avail"] = left["ts"] + pd.Timedelta(etf)
-    out = pd.merge_asof(left, h, on="avail", direction="backward")
-    out = out.drop(columns=["ts", "avail"])
-    out.index = m.index
-    return out
-
-
-def read_market(m, h1, h4, btc4, etf):
-    """Market reader. Kondisi per candle entry:
-    TREND_UP   : bias 4h naik (close>EMA200), EMA21>EMA55 di 1h, ADX 1h > batas trend
-    TREND_DOWN : kebalikannya
-    RANGE      : ADX 1h < batas range
-    NONE       : sisanya (transisi) -> tidak trade"""
-    m = m.copy()
-    _add_range_indicators(m)
-    h4 = h4.copy()
-    h4["h4_bias"] = np.sign(h4["close"] - h4["ema_trend"]).fillna(0)
-    a = _htf_asof(m, h1, "1h", ["atr", "adx", "ema_fast", "ema_slow"], etf).add_prefix("h1_")
-    b = _htf_asof(m, h4, "4h", ["h4_bias"], etf)
-    c = _htf_asof(m, btc4, "4h", ["h4_bias"], etf).rename(columns={"h4_bias": "btc_bias"})
-    m = pd.concat([m, a, b, c], axis=1)
-    m["atr"] = m["h1_atr"]   # jarak SL memakai ATR 1h
-    up = (m["h4_bias"] == 1) & (m["h1_ema_fast"] > m["h1_ema_slow"]) & (m["h1_adx"] > ADX_TREND_THRESHOLD)
-    dn = (m["h4_bias"] == -1) & (m["h1_ema_fast"] < m["h1_ema_slow"]) & (m["h1_adx"] > ADX_TREND_THRESHOLD)
-    rg = m["h1_adx"] < ADX_RANGE_THRESHOLD
-    m["regime"] = np.select([up, dn, rg], ["TREND_UP", "TREND_DOWN", "RANGE"], default="NONE")
-    return m
-
-
-def make_mtf_signal(m):
-    """Entry (5m/15m) sesuai kondisi pasar. TREND: RSI pullback selesai searah tren.
-    RANGE: reversal (RSI, Stoch, Bollinger) gaya Strategy002. Hanya jika jarak SL >= MIN_SL_PCT
-    dan bias BTC tidak berlawanan."""
-    c = m["close"].to_numpy()
-    rsi = m["rsi"].to_numpy()
-    prev = np.r_[np.nan, rsi[:-1]]
-    f, s = m["ema_fast"].to_numpy(), m["ema_slow"].to_numpy()
-    reg = m["regime"].to_numpy()
-    stk, bbl, bbu = m["stoch_k"].to_numpy(), m["bb_lower"].to_numpy(), m["bb_upper"].to_numpy()
-
-    def event(x):
-        return x & ~np.r_[False, x[:-1]]
-
-    t_long = (reg == "TREND_UP") & (f > s) & (prev <= MTF_RSI_LONG) & (rsi > MTF_RSI_LONG)
-    t_short = (reg == "TREND_DOWN") & (f < s) & (prev >= MTF_RSI_SHORT) & (rsi < MTF_RSI_SHORT)
-    r_long = event((reg == "RANGE") & (rsi < RSI_OVERSOLD) & (stk < STOCH_LOW) & (c < bbl))
-    r_short = event((reg == "RANGE") & (rsi > RSI_OVERBOUGHT) & (stk > STOCH_HIGH) & (c > bbu))
-    vol_ok = MTF_SL_ATR * m["atr"].to_numpy() / c >= MIN_SL_PCT
-    btc = m["btc_bias"].to_numpy()
-    long_sig = (t_long | r_long) & vol_ok & (btc != -1)
-    short_sig = (t_short | r_short) & vol_ok & (btc != 1)
-
-    def get_signal(i, position):
-        if position is not None:
-            return None
-        if long_sig[i]:
-            return "long"
-        if short_sig[i]:
-            return "short"
-        return None
-
-    return get_signal
-
-
-def _open_mtf(side, ts, open_, sl_dist, tp_r, i0):
-    sign = 1 if side == "long" else -1
-    entry_price = open_ * (1 + sign * SLIPPAGE)
-    return {
-        "side": side, "entry_ts": ts, "entry_price": entry_price,
-        "sl_price": entry_price - sign * sl_dist,
-        # TP NET: profit bersih setelah fee + slippage = tp_r x R (bukan sebelum biaya)
-        "tp_price": ((entry_price + sign * (tp_r * sl_dist + ROUND_TRIP_FEE * entry_price))
-                     / (1 - sign * SLIPPAGE)) if tp_r else None,
-        "size": min(MAX_LEVERAGE, RISK_PER_TRADE / (sl_dist / entry_price)),
-        "r_dist": sl_dist, "i0": i0, "be_done": False,
-    }
-
-
-def _break_even(position, be_r, high, low):
-    """Profit mencapai be_r x R -> SL pindah ke impas (entry + fee + slippage)."""
-    if position["be_done"]:
-        return
-    e, d = position["entry_price"], position["r_dist"]
-    if position["side"] == "long":
-        if high >= e + be_r * d:
-            position["sl_price"] = max(position["sl_price"], e * (1 + ROUND_TRIP_FEE) / (1 - SLIPPAGE))
-            position["be_done"] = True
-    elif low <= e - be_r * d:
-        position["sl_price"] = min(position["sl_price"], e * (1 - ROUND_TRIP_FEE) / (1 + SLIPPAGE))
-        position["be_done"] = True
-
-
-def _roi_fill(position, cfg, i, open_, high, low):
-    """Gaya freqtrade minimal_roi: target profit menurun seiring umur trade (menit)."""
-    age = (i - position["i0"]) * cfg["bar_min"]
-    roi = None
-    for minutes, r in cfg["roi"]:
-        if age >= minutes:
-            roi = r
-    if roi is None:
-        return None
-    e = position["entry_price"]
-    if position["side"] == "long":
-        target = e * (1 + roi)
-        return (max(open_, target), "roi") if high >= target else None
-    target = e * (1 - roi)
-    return (min(open_, target), "roi") if low <= target else None
-
-
-def _simulate_mtf(df, get_signal, allow_short, cfg):
-    """Loop eksekusi. Aksi di open candle berikutnya (sama seperti _simulate).
-    Exit: SL / TP / break-even / time-stop (cfg 'ATR') atau SL tetap % + ROI table (cfg 'FT')."""
-    opens = df["open"].to_numpy()
-    highs = df["high"].to_numpy()
-    lows = df["low"].to_numpy()
-    atrs = df["atr"].to_numpy()
-    tss = df["ts"].tolist()
-    trades, position, pending, pending_atr = [], None, None, None
-    for i in range(1, len(df)):
-        if pending is not None:
-            if position is None and (pending == "long" or (pending == "short" and allow_short)):
-                sl_dist = cfg["sl_pct"] * opens[i] if cfg["sl_pct"] else cfg["sl_atr"] * pending_atr
-                if sl_dist > 0:
-                    position = _open_mtf(pending, tss[i], opens[i], sl_dist, cfg["tp_r"], i)
-            pending = None
-
-        if position is not None and cfg["max_bars"] and i - position["i0"] >= cfg["max_bars"]:
-            trades.append(_close_position(position, tss[i], opens[i], "time_stop"))
-            position = None
-
-        sig = cfg.get("exit_sig")
-        if position is not None and sig is not None and position["i0"] < i and sig[i - 1]:
-            if not cfg.get("exit_profit_only") or (
-                    (opens[i] * (1 - SLIPPAGE) - position["entry_price"]) / position["entry_price"] - ROUND_TRIP_FEE > 0):
-                trades.append(_close_position(position, tss[i], opens[i], "exit_signal"))
-                position = None
-
-        if position is not None:
-            hit = _exit_fill(position, opens[i], highs[i], lows[i])
-            if hit is None and cfg["roi"]:
-                hit = _roi_fill(position, cfg, i, opens[i], highs[i], lows[i])
-            if hit is not None:
-                trades.append(_close_position(position, tss[i], hit[0], hit[1]))
-                position = None
-            elif cfg["be_r"]:
-                _break_even(position, cfg["be_r"], highs[i], lows[i])
-
-        if position is not None:
-            _track_excursion(position, highs[i], lows[i])
-
-        pending = get_signal(i, position)
-        pending_atr = atrs[i]
-    return trades
-
-
-FTS_TF = "5m"   # Strategy003/004/005 dirancang untuk 5m
-FTS_ROI_3_4 = [(0, 0.05), (20, 0.04), (30, 0.03), (60, 0.01)]
-FTS_ROI_5 = [(0, 0.05), (20, 0.04), (40, 0.03), (80, 0.02), (1440, 0.01)]
-
-
-def _stochf(d, n):
-    ll, hh = d["low"].rolling(n).min(), d["high"].rolling(n).max()
-    k = 100 * (d["close"] - ll) / (hh - ll).replace(0, np.nan)
-    return k, k.rolling(3).mean()
-
-
-def _crossed_above(a, b):
-    b0 = b.shift(1) if hasattr(b, "shift") else b
-    return (a > b) & (a.shift(1) <= b0)
-
-
-def _sar(high, low, af0=0.02, af_max=0.2):
-    """Parabolic SAR (Wilder), pengganti ta.SAR."""
-    n = len(high)
-    out = np.full(n, np.nan)
-    if n < 3:
-        return out
-    long = high[1] >= high[0]
-    ep = high[1] if long else low[1]
-    s = low[0] if long else high[0]
-    af = af0
-    for i in range(2, n):
-        s = s + af * (ep - s)
-        if long:
-            s = min(s, low[i - 1], low[i - 2])
-            if low[i] < s:
-                long, s, ep, af = False, ep, low[i], af0
-            elif high[i] > ep:
-                ep, af = high[i], min(af + af0, af_max)
-        else:
-            s = max(s, high[i - 1], high[i - 2])
-            if high[i] > s:
-                long, s, ep, af = True, ep, high[i], af0
-            elif low[i] < ep:
-                ep, af = low[i], min(af + af0, af_max)
-        out[i] = s
-    return out
-
-
-def freqtrade_batch_signals(m):
-    """Port Strategy003/004/005 (freqtrade-strategies, long-only, 5m).
-    Return {nama: (entry, exit, roi)}. Strategy005 memakai buy/sell_params dari file-nya."""
-    c, h, l, v, rsi = m["close"], m["high"], m["low"], m["volume"], m["rsi"]
-    ema = lambda n: c.ewm(span=n, adjust=False).mean()
-    arr = lambda s: s.to_numpy(dtype=bool)
-    fisher = np.tanh(0.1 * (rsi - 50))
-    sma40 = c.rolling(40).mean()
-    sar = pd.Series(_sar(h.to_numpy(), l.to_numpy()), index=m.index)
-    fastk, fastd = _stochf(m, 5)
-    tp = (h + l + c) / 3
-    dtp, mf = tp.diff(), tp * v
-    pos = mf.where(dtp > 0, 0.0).rolling(14).sum()
-    neg = mf.where(dtp < 0, 0.0).rolling(14).sum()
-    mfi = 100 * pos / (pos + neg).replace(0, np.nan)
-
-    e3 = ((rsi < 28) & (rsi > 0) & (c < sma40) & (fisher < -0.94) & (mfi < 16.0)
-          & ((ema(50) > ema(100)) | _crossed_above(ema(5), ema(10)))
-          & (fastd > fastk) & (fastd > 0))
-    x3 = (sar > c) & (fisher > 0.3)
-
-    slowadx = _compute_adx(m, 35)
-    cci = (tp - tp.rolling(14).mean()) / (0.015 * tp.rolling(14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True))
-    fk50, fd50 = _stochf(m, 50)
-    e4 = (((m["adx"] > 50) | (slowadx > 26)) & (cci < -100)
-          & (fastk.shift(1) < 20) & (fastd.shift(1) < 20)
-          & (fk50.shift(1) < 30) & (fd50.shift(1) < 30)
-          & (fastk.shift(1) < fastd.shift(1)) & (fastk > fastd)
-          & (v.rolling(12).mean() > 0.75))
-    x4 = (slowadx < 25) & ((fastk > 70) | (fastd > 70)) & (fastk.shift(1) < fastd.shift(1)) & (c > ema(5))
-
-    macd = ema(12) - ema(26)
-    up, dn = h.diff(), -l.diff()
-    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=m.index)
-    pc = c.shift(1)
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    minus_di = 100 * mdm.ewm(alpha=1 / 14, adjust=False).mean() / tr.ewm(alpha=1 / 14, adjust=False).mean()
-    e5 = ((v > v.rolling(150).mean() * 4) & (c < sma40) & (fastd > fastk)
-          & (rsi > 26) & (fastd > 1) & (50 * (fisher + 1) < 5))
-    x5 = _crossed_above(rsi, 74) & (macd < 0) & (minus_di > 4)
-
-    return {
-        "Strategy003": (arr(e3), arr(x3), FTS_ROI_3_4),
-        "Strategy004": (arr(e4), arr(x4), FTS_ROI_3_4),
-        "Strategy005": (arr(e5), arr(x5), FTS_ROI_5),
-    }
-
-
-def run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix):
-    """Entry + exit signal Strategy003/004/005 dibungkus manajemen risiko yang sama dengan model ATR
-    (SL 2xATR 1h, TP 1.5R/2R, BE 1R, time-stop 24 jam). Hasil per kondisi pasar:
-    FTS_<nama>_<ALL|TREND_UP|TREND_DOWN|RANGE>. ROI table dan SL -10% aslinya tidak dipakai."""
-    bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
-    max_bars = MTF_MAX_HOURS * 60 // bar_min
-    for name, (entry, exit_sig, _roi) in freqtrade_batch_signals(m).items():
-        def get_signal(i, position, entry=entry):
-            return "long" if position is None and entry[i] else None
-        for tp in MTF_TP_R:
-            cfg = {"sl_atr": MTF_SL_ATR, "sl_pct": None, "tp_r": tp, "be_r": MTF_BE_R,
-                   "max_bars": max_bars, "roi": None, "bar_min": bar_min,
-                   "exit_sig": exit_sig, "exit_profit_only": True}
-            trades = _simulate_mtf(m, get_signal, False, cfg)
-            for t in trades:
-                t["regime"] = reg_map.get(pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf), "NONE")
-            tp_label = f"BE{MTF_BE_R:g}R_TP{tp:g}R_{MTF_MAX_HOURS}h"
-            for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
-                sub_t = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
-                for period, tr in split_by_period(sub_t, split_ts).items():
-                    all_results.append(compute_metrics(
-                        tr, f"FTS_{name}_{label}{suffix}", symbol, etf,
-                        f"ATR1hx{MTF_SL_ATR:g}", tp_label, period, "long_only"))
-
-
-EXC_LEVELS = [0.5, 1.0, 1.5, 2.0, 3.0]    # target dalam kelipatan R
-OUTPUT_EXC_CSV = "excursion.csv"
-EXC_ROWS = []
-
-
-def _track_excursion(position, high, low):
-    """Catat gerak maksimum searah (mfe_r) dan berlawanan (mae_r), dalam kelipatan R."""
-    e, r = position["entry_price"], position["r_dist"]
-    if position["side"] == "long":
-        fav, adv = (high - e) / r, (e - low) / r
-    else:
-        fav, adv = (e - low) / r, (high - e) / r
-    position["mfe_r"] = max(position.get("mfe_r", 0.0), fav)
-    position["mae_r"] = max(position.get("mae_r", 0.0), adv)
-
-
-def make_random_signal(m, seed=0, p=0.01):
-    """Entry acak sebagai pembanding: kondisi pasar sama (TREND_UP long, TREND_DOWN short,
-    RANGE arah acak), filter bias BTC sama, tanpa indikator entry."""
-    rng = np.random.default_rng(seed)
-    reg, btc = m["regime"].to_numpy(), m["btc_bias"].to_numpy()
-    coin = rng.random(len(m)) < 0.5
-    is_long = np.where(reg == "TREND_UP", True, np.where(reg == "TREND_DOWN", False, coin))
-    ok = (reg != "NONE") & (rng.random(len(m)) < p) & np.where(is_long, btc != -1, btc != 1)
-
-    def get_signal(i, position):
-        if position is not None or not ok[i]:
-            return None
-        return "long" if is_long[i] else "short"
-
-    return get_signal
-
-
-def run_excursion_probe(m, symbol, etf, split_ts, reg_map, strat_signal, max_bars, bar_min):
-    """Uji kualitas entry tanpa TP/BE: SL 1R (2 x ATR 1h) + time-stop, lalu hitung berapa trade
-    yang sempat bergerak +kR searah sebelum kena SL/time-stop. Sumber: 'strategi' vs 'acak'."""
-    cfg = {"sl_atr": MTF_SL_ATR, "sl_pct": None, "tp_r": None, "be_r": None,
-           "max_bars": max_bars, "roi": None, "bar_min": bar_min}
-    for source, sig in (("strategi", strat_signal), ("acak", make_random_signal(m))):
-        trades = _simulate_mtf(m, sig, True, cfg)
-        for t in trades:
-            t["regime"] = reg_map.get(pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf), "NONE")
-        for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
-            sub_t = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
-            for side in ("long", "short"):
-                parts = split_by_period([t for t in sub_t if t["side"] == side], split_ts)
-                for period in ("IS", "OOS"):
-                    tr = parts[period]
-                    row = {"symbol": symbol, "timeframe": etf, "source": source, "regime": label,
-                           "side": side, "period": period, "n": len(tr)}
-                    for k in EXC_LEVELS:
-                        row[f"k{k:g}"] = sum(1 for t in tr if t["mfe_r"] >= k)
-                    EXC_ROWS.append(row)
-
-
-def run_mtf(exchange, all_results, raw_trades):
-    """Jalankan MTF dalam dua versi biaya: net (ala Bitget: sudah dipotong fee + slippage,
-    profit baru muncul setelah lewat BEP) dan gross (tanpa biaya). Selisihnya menunjukkan
-    apakah masalahnya strategi/regime atau biaya."""
-    global ROUND_TRIP_FEE, SLIPPAGE
-    orig = (ROUND_TRIP_FEE, SLIPPAGE)
-    try:
-        for version, (fee, slip) in COST_VERSIONS.items():
-            ROUND_TRIP_FEE, SLIPPAGE = fee, slip
-            print(f"\n##### MTF versi biaya: {version} (fee={fee}, slippage={slip}) #####")
-            _run_mtf_once(exchange, all_results, raw_trades, version)
-    finally:
-        ROUND_TRIP_FEE, SLIPPAGE = orig
-
-
-def _run_mtf_once(exchange, all_results, raw_trades, version):
-    """Jalankan market reader + entry per timeframe di MTF_ENTRY_TFS. Hasil dicatat per kondisi
-    pasar (strategi MTF_<model>_<ALL|TREND_UP|TREND_DOWN|RANGE>), model ATR (SL ATR 1h, BE 1R,
-    TP 1.5/2R, time-stop 24 jam) dan FT (pembanding gaya freqtrade)."""
-    suffix = "" if version == "net" else "_gross"
-    def load(symbol, tf, days):
-        d = fetch_ohlcv_cached(exchange, symbol, tf, days)
-        if d is None or len(d) < 100:
-            print(f"  [!] Data {symbol} {tf} tidak cukup, MTF skip.")
-            return None
-        if any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(d, tf)):
-            print(f"  [!] Gap besar di {symbol} {tf}, MTF skip.")
-            return None
-        return add_indicators(d)
-
-    btc = load(MTF_ANCHOR, "4h", DAYS_BACK)
-    if btc is None:
-        print("[!] Data BTC 4h tidak ada, MTF dilewati.")
-        return
-    btc4 = btc[["ts"]].copy()
-    btc4["h4_bias"] = np.sign(btc["close"] - btc["ema_trend"]).fillna(0)
-
-    for etf in MTF_ENTRY_TFS:
-        bar_min = int(pd.Timedelta(etf).total_seconds() // 60)
-        max_bars = MTF_MAX_HOURS * 60 // bar_min
-        models = [
-            ("ATR", f"ATR1hx{MTF_SL_ATR:g}", f"BE{MTF_BE_R:g}R_TP{tp:g}R_{MTF_MAX_HOURS}h",
-             {"sl_atr": MTF_SL_ATR, "sl_pct": None, "tp_r": tp, "be_r": MTF_BE_R,
-              "max_bars": max_bars, "roi": None, "bar_min": bar_min})
-            for tp in MTF_TP_R
-        ]
-        models.append(("FT", f"FT-{FT_SL_PCT:.0%}", "ROI-table",
-                       {"sl_atr": None, "sl_pct": FT_SL_PCT, "tp_r": None, "be_r": None,
-                        "max_bars": max_bars, "roi": FT_ROI, "bar_min": bar_min}))
-
-        for symbol in PAIRS:
-            print(f"\n=== MTF {symbol} ({etf} entry, 1h/4h reader) ===")
-            m = load(symbol, etf, MTF_DAYS.get(etf, DAYS_BACK))
-            h1, h4 = load(symbol, "1h", DAYS_BACK), load(symbol, "4h", DAYS_BACK)
-            if m is None or h1 is None or h4 is None:
-                continue
-            m = read_market(m, h1, h4, btc4, etf)
-            print("  kondisi:", m["regime"].value_counts(normalize=True).round(2).to_dict())
-            split_ts = m["ts"].iloc[0] + (m["ts"].iloc[-1] - m["ts"].iloc[0]) / 2
-            if version == "net":
-                REGIME_ROWS.extend(regime_forward_rows(m, symbol, etf, split_ts))
-            reg_map = dict(zip(m["ts"], m["regime"]))
-            get_signal = make_mtf_signal(m)
-            if version == "gross":
-                run_excursion_probe(m, symbol, etf, split_ts, reg_map, get_signal, max_bars, bar_min)
-            if etf == FTS_TF:
-                run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix)
-            for mode, allow_short in MODES.items():
-                for model, sl_label, tp_label, cfg in models:
-                    trades = _simulate_mtf(m, get_signal, allow_short, cfg)
-                    for t in trades:
-                        sig_ts = pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf)
-                        t["regime"] = reg_map.get(sig_ts, "NONE")
-                    for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
-                        sub = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
-                        for period, tr in split_by_period(sub, split_ts).items():
-                            all_results.append(compute_metrics(
-                                tr, f"MTF_{model}_{label}{suffix}", symbol, etf, sl_label, tp_label, period, mode))
-                    if version == "net" and (model == "FT" or tp_label.startswith("BE1R_TP2R")):   # simpan trade mentah model utama saja
-                        raw_trades[f"{symbol}_{etf}_mtf_{model}_{tp_label}_{mode}"] = trades
-
-
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
-
     all_results = []
-    raw_trades = {}
-
     for symbol in PAIRS:
         for tf in TIMEFRAMES:
             print(f"\n=== Fetching {symbol} {tf} ({DAYS_BACK} hari) ===")
             df = fetch_ohlcv_cached(exchange, symbol, tf, DAYS_BACK)
             if df is None or len(df) < 100:
-                print(f"  [!] Data tidak cukup untuk {symbol} {tf} (dapat {0 if df is None else len(df)} candle), skip.")
+                print(f"  [!] Data tidak cukup untuk {symbol} {tf}, skip.")
                 continue
-            print(f"  -> SELESAI: {len(df)} candle didapat ({df['ts'].iloc[0]} s/d {df['ts'].iloc[-1]})")
-
-            gaps = find_ohlcv_gaps(df, tf)
-            if gaps:
-                print(f"  [gap] {len(gaps)} gap, total {sum(g[2] for g in gaps)} candle hilang, terbesar {max(g[2] for g in gaps)}")
-            big_gaps = [g for g in gaps if g[2] > MAX_GAP_CANDLES]
+            print(f"  -> {len(df)} candle ({df['ts'].iloc[0]} s/d {df['ts'].iloc[-1]})")
+            big_gaps = [g for g in find_ohlcv_gaps(df, tf) if g[2] > MAX_GAP_CANDLES]
             if big_gaps:
-                for before, after, missing in big_gaps[:3]:
-                    print(f"      {before} -> {after} (~{missing} candle hilang)")
-                print(f"  [!] {len(big_gaps)} gap besar (> {MAX_GAP_CANDLES} candle) di {symbol} {tf}, skip agar SL tidak disimulasikan melewati data hilang.")
+                print(f"  [!] {len(big_gaps)} gap besar (> {MAX_GAP_CANDLES} candle) di {symbol} {tf}, skip.")
                 continue
 
-            df = add_indicators(df)
-            # Titik tengah rentang waktu: sebelum = in-sample, sesudah = out-of-sample
+            ut = ut_bot(df)
             split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
-
-            for sl in SL_ATR_MULTS:
-                sl_label = f"ATRx{sl:g}"
-
-                for tp in TP_R_MULTS:
-                    tp_label = "none" if tp is None else f"{tp:g}R"
-
-                    for mode, allow_short in MODES.items():
-                        tf_trades = run_trend_following(df, sl, tp, allow_short)
-                        mr_trades = run_mean_reversion(df, sl, tp, allow_short)
-                        rs_trades = run_regime_switch(df, sl, tp, allow_short)
-
-                        for period, trades in split_by_period(tf_trades, split_ts).items():
-                            all_results.append(compute_metrics(trades, "TrendFollowing_EMA21_55", symbol, tf, sl_label, tp_label, period, mode))
-                        for period, trades in split_by_period(mr_trades, split_ts).items():
-                            all_results.append(compute_metrics(trades, "MeanReversion_RSI14", symbol, tf, sl_label, tp_label, period, mode))
-                        for period, trades in split_by_period(rs_trades, split_ts).items():
-                            all_results.append(compute_metrics(trades, "RegimeSwitch_ADX", symbol, tf, sl_label, tp_label, period, mode))
-
-                        key = f"{symbol}_{tf}_%s_sl{sl_label}_tp{tp_label}_{mode}"
-                        raw_trades[key % "trend"] = tf_trades
-                        raw_trades[key % "meanrev"] = mr_trades
-                        raw_trades[key % "regimeswitch"] = rs_trades
-
-            # Strategi tunggal (trend pullback): EMA stack + ADX + RSI pullback,
-            # filter EMA200 & BOS searah, exit trailing SL
-            if tf in UNIFIED_TIMEFRAMES:
-                conf_filt = make_confluence_filter(df)
-                conf_sl, conf_tp = f"ATRx{CONF_SL_MULT:g}", f"trail{TRAIL_ATR_MULT:g}"
+            for session in SESSIONS:
                 for mode, allow_short in MODES.items():
-                    trades = run_unified(df, CONF_SL_MULT, None, allow_short, TRAIL_ATR_MULT, conf_filt)
-                    for period, tr in split_by_period(trades, split_ts).items():
-                        all_results.append(compute_metrics(tr, "Unified_TrendPullback", symbol, tf, conf_sl, conf_tp, period, mode))
-                    raw_trades[f"{symbol}_{tf}_unified_sl{conf_sl}_tp{conf_tp}_{mode}"] = trades
-
-    run_mtf(exchange, all_results, raw_trades)
-    if REGIME_ROWS:
-        pd.DataFrame(REGIME_ROWS).to_csv(OUTPUT_REGIME_CSV, index=False)
-    if EXC_ROWS:
-        pd.DataFrame(EXC_ROWS).to_csv(OUTPUT_EXC_CSV, index=False)
+                    trades = simulate_ut(df, ut, session, allow_short)
+                    for cost_name, cost in COST_VERSIONS.items():
+                        suffix = "" if cost_name == "net" else "_gross"
+                        name = f"UT_a{UT_A:g}_c{UT_C}_{session}{suffix}"
+                        for period, tr in split_by_period(apply_costs(trades, cost), split_ts).items():
+                            all_results.append(compute_metrics(
+                                tr, name, symbol, tf, "SL1R_fixed", "trail_UT", period, mode))
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
 
-    # simpan hasil
     with open(OUTPUT_JSON, "w") as f:
-        json.dump({"summary": all_results, "trades": raw_trades}, f, indent=2, default=str)
-
+        json.dump({"summary": all_results}, f, indent=2, default=str)
     df_summary = pd.DataFrame(all_results)
-    df_summary = df_summary.sort_values(["timeframe", "strategy", "mode", "stop_loss", "take_profit", "symbol", "period"])
+    df_summary = df_summary.sort_values(["timeframe", "strategy", "mode", "symbol", "period"])
     df_summary.to_csv(OUTPUT_CSV, index=False)
-
     print("\n" + "=" * 100)
-    print("RINGKASAN HASIL (per timeframe, strategi, mode, SL, TP, pair, periode full/IS/OOS)")
-    print("=" * 100)
     print(df_summary.to_string(index=False))
     print(f"\nDisimpan ke: {OUTPUT_CSV} dan {OUTPUT_JSON}")
 
