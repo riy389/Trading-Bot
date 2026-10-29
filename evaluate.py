@@ -141,18 +141,22 @@ def ut_report(df):
     if d.empty:
         return ""
     keys = ["strategy", "timeframe"]
-    cols = ["n_trades", "n_sl", "n_tp_fixed", "n_trail_win", "n_trail_loss", "n_session", "n_reverse",
+    cols = ["n_trades", "n_sl", "n_tp_fixed", "n_trail_win", "n_trail_loss", "n_be", "n_session", "n_reverse",
             "win_rate_pct", "profit_factor", "avg_gross_R"]
     if not set(cols) <= set(d.columns):
         return ""
     t = d[d["period"] == "full"].set_index(keys)[cols].copy()
     pf = d.pivot_table(index=keys, columns="period", values="profit_factor", aggfunc="median")
     t["pf_is"], t["pf_oos"] = pf.get("IS"), pf.get("OOS")
+    nt = df[df["strategy"].str.startswith("UT_") & ~df["strategy"].str.endswith("_gross") & (df["period"] == "full")].copy()
+    nt["strategy"] = nt["strategy"] + "_gross"
+    nt = nt.set_index(keys)[["profit_factor", "avg_net_R"]]
+    t["pf_net"], t["netR"] = nt["profit_factor"], nt["avg_net_R"]
     t = t.reset_index()
     t["strategy"] = t["strategy"].str.replace(r"^UT_a[^_]+_c\d+_", "", regex=True).str.replace("_gross", "", regex=False)
     t["timeframe"] = pd.Categorical(t["timeframe"], ["5m", "15m", "1h", "4h"], ordered=True)
     t = t.sort_values(["strategy", "timeframe"]).rename(columns={
-        "n_trades": "n", "n_sl": "sl", "n_tp_fixed": "tp", "n_trail_win": "trW", "n_trail_loss": "trL",
+        "n_trades": "n", "n_sl": "sl", "n_tp_fixed": "tp", "n_trail_win": "trW", "n_trail_loss": "trL", "n_be": "be",
         "n_session": "sess", "n_reverse": "rev", "win_rate_pct": "wr", "profit_factor": "pf", "avg_gross_R": "avgR"})
     return ("\n### UT BTC: exit per varian (gross, 2 tahun). sl=kena SL 1R, tp=TP tetap, trW/trL=trailing untung/rugi,"
             " sess=tutup paksa, rev=sinyal balik, wr=% trade untung\n```\n" + t.round(2).to_string(index=False) + "\n```")

@@ -47,7 +47,11 @@ MIN_SL_PCT = 0.0             # jarak SL minimum (% harga); 0 = mati
 SESSIONS = ["24h", "free"]
 TP_R = 1.5                   # TP tetap = TP_R x 1R dari entry (gross)
 # varian exit: nama -> (pakai trailing UT, pakai TP tetap)
-VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, True)}
+VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, True),
+            "trail_be1": (True, False), "trail_be05": (True, False)}
+# BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
+BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
+BE_COST = COST_VERSIONS["net"]
 SESSION_LAST_ENTRY_MIN = 22 * 60   # 22:00 UTC = 05:00 WIB, entry terakhir
 SESSION_CLOSE_MIN = 23 * 60        # 23:00 UTC = 06:00 WIB, tutup paksa
 
@@ -248,7 +252,7 @@ def apply_costs(trades, cost):
     return out
 
 
-def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
+def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -287,6 +291,9 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
         if pos is not None:
             sign = 1 if pos["side"] == "long" else -1
             sl = pos["sl"]
+            be_on = be_r is not None and pos["mfe"] >= be_r
+            if be_on:
+                sl = pos["entry"] * (1 + sign * BE_COST)
             trail = stop[i - 1]
             use_trail = trail_on and sign * (trail - sl) > 0
             lvl = trail if use_trail else sl
@@ -297,7 +304,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
             reason = None
             if fill is not None:
                 if not use_trail:
-                    reason = "stop_loss"
+                    reason = "be_stop" if be_on else "stop_loss"
                 else:
                     reason = "trail_win" if sign * (fill - pos["entry"]) > 0 else "trail_loss"
             elif tp_on:
@@ -321,7 +328,8 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False):
 
 
 REASONS = {"stop_loss": "n_sl", "tp_fixed": "n_tp_fixed", "trail_win": "n_trail_win",
-           "trail_loss": "n_trail_loss", "session_end": "n_session", "reverse": "n_reverse"}
+           "trail_loss": "n_trail_loss", "session_end": "n_session", "reverse": "n_reverse",
+           "be_stop": "n_be"}
 
 
 def _reason_counts(trades):
@@ -416,8 +424,8 @@ def main():
             for session in SESSIONS:
                 for mode, allow_short in MODES.items():
                     for vname, (trail_on, tp_on) in VARIANTS.items():
-                        trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on)
-                        tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "") if x)
+                        trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname))
+                        tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x)
                         for cost_name, cost in COST_VERSIONS.items():
                             suffix = "" if cost_name == "net" else "_gross"
                             name = f"UT_a{UT_A:g}_c{UT_C}_{session}_{vname}{suffix}"
