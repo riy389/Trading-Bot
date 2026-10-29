@@ -90,6 +90,32 @@ def mtf_report(df):
     return "\n### MTF per kondisi pasar (OOS, WR hanya info)\n```\n" + t.round(2).to_string(index=False) + "\n```"
 
 
+def excursion_report(path="excursion.csv"):
+    """Kualitas entry vs entry acak (kondisi pasar sama, SL 1R, tanpa TP/BE, time-stop 24 jam).
+    Selisih = peluang strategi bergerak +kR searah sebelum kena SL dikurangi entry acak (poin persen)."""
+    if not os.path.exists(path):
+        return ""
+    r = pd.read_csv(path)
+    ks = [c for c in r.columns if c.startswith("k")]
+    g = r.groupby(["timeframe", "regime", "side", "period", "source"])[["n"] + ks].sum()
+    j = g.xs("strategi", level="source").join(g.xs("acak", level="source"), lsuffix="_s", rsuffix="_a", how="inner").reset_index()
+    j = j[(j["n_s"] >= 30) & (j["n_a"] >= 30)]
+    if j.empty:
+        return ""
+    out = j[["timeframe", "regime", "side", "period"]].copy()
+    out["n_str"], out["n_acak"] = j["n_s"], j["n_a"]
+    for k in ks:
+        out["d" + k[1:] + "R"] = 100 * (j[k + "_s"] / j["n_s"] - j[k + "_a"] / j["n_a"])
+    out["str_1R"] = 100 * j["k1_s"] / j["n_s"]
+    out["acak_1R"] = 100 * j["k1_a"] / j["n_a"]
+    p = (j["k1_s"] + j["k1_a"]) / (j["n_s"] + j["n_a"])
+    out["se_1R"] = 100 * np.sqrt(p * (1 - p) * (1 / j["n_s"] + 1 / j["n_a"]))
+    out = out.sort_values(["timeframe", "regime", "side", "period"])
+    return ("\n### Kualitas entry vs entry acak (SL 1R, tanpa TP/BE, 24 jam). dXR = selisih peluang bergerak +X R sebelum SL, poin persen."
+            " >0 lebih baik dari acak, ~0 tanpa edge arah, <0 lebih buruk (entry telat). Selisih nyata kalau > 2 x se_1R\n```\n"
+            + out.round(1).to_string(index=False) + "\n```")
+
+
 def regime_report(path="regime_forward.csv"):
     if not os.path.exists(path):
         return ""
@@ -112,7 +138,7 @@ def regime_report(path="regime_forward.csv"):
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else CSV
     df = load(path)
-    text = render(evaluate(df)) + mtf_report(df) + regime_report()
+    text = render(evaluate(df)) + mtf_report(df) + regime_report() + excursion_report()
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

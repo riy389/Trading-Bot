@@ -329,6 +329,7 @@ def _close_position(position, ts, raw_exit_price, reason):
         "entry_price": position["entry_price"], "exit_price": exit_price,
         "size": position["size"],
         "pnl_pct": (gross - ROUND_TRIP_FEE) * position["size"], "exit_reason": reason,
+        "mfe_r": position.get("mfe_r", 0.0), "mae_r": position.get("mae_r", 0.0),
     }
 
 
@@ -534,8 +535,8 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
 
     pnls = [t["pnl_pct"] for t in trades]
     n = len(pnls)
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
+    wins = [p for p in pnls if p > 1e-9]
+    losses = [p for p in pnls if p <= 1e-9]
     win_rate = len(wins) / n * 100
 
     gross_profit = sum(wins)
@@ -712,7 +713,9 @@ def _open_mtf(side, ts, open_, sl_dist, tp_r, i0):
     return {
         "side": side, "entry_ts": ts, "entry_price": entry_price,
         "sl_price": entry_price - sign * sl_dist,
-        "tp_price": entry_price + sign * tp_r * sl_dist if tp_r else None,
+        # TP NET: profit bersih setelah fee + slippage = tp_r x R (bukan sebelum biaya)
+        "tp_price": ((entry_price + sign * (tp_r * sl_dist + ROUND_TRIP_FEE * entry_price))
+                     / (1 - sign * SLIPPAGE)) if tp_r else None,
         "size": min(MAX_LEVERAGE, RISK_PER_TRADE / (sl_dist / entry_price)),
         "r_dist": sl_dist, "i0": i0, "be_done": False,
     }
@@ -786,6 +789,9 @@ def _simulate_mtf(df, get_signal, allow_short, cfg):
                 position = None
             elif cfg["be_r"]:
                 _break_even(position, cfg["be_r"], highs[i], lows[i])
+
+        if position is not None:
+            _track_excursion(position, highs[i], lows[i])
 
         pending = get_signal(i, position)
         pending_atr = atrs[i]
@@ -909,6 +915,61 @@ def run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix):
                         f"ATR1hx{MTF_SL_ATR:g}", tp_label, period, "long_only"))
 
 
+EXC_LEVELS = [0.5, 1.0, 1.5, 2.0, 3.0]    # target dalam kelipatan R
+OUTPUT_EXC_CSV = "excursion.csv"
+EXC_ROWS = []
+
+
+def _track_excursion(position, high, low):
+    """Catat gerak maksimum searah (mfe_r) dan berlawanan (mae_r), dalam kelipatan R."""
+    e, r = position["entry_price"], position["r_dist"]
+    if position["side"] == "long":
+        fav, adv = (high - e) / r, (e - low) / r
+    else:
+        fav, adv = (e - low) / r, (high - e) / r
+    position["mfe_r"] = max(position.get("mfe_r", 0.0), fav)
+    position["mae_r"] = max(position.get("mae_r", 0.0), adv)
+
+
+def make_random_signal(m, seed=0, p=0.01):
+    """Entry acak sebagai pembanding: kondisi pasar sama (TREND_UP long, TREND_DOWN short,
+    RANGE arah acak), filter bias BTC sama, tanpa indikator entry."""
+    rng = np.random.default_rng(seed)
+    reg, btc = m["regime"].to_numpy(), m["btc_bias"].to_numpy()
+    coin = rng.random(len(m)) < 0.5
+    is_long = np.where(reg == "TREND_UP", True, np.where(reg == "TREND_DOWN", False, coin))
+    ok = (reg != "NONE") & (rng.random(len(m)) < p) & np.where(is_long, btc != -1, btc != 1)
+
+    def get_signal(i, position):
+        if position is not None or not ok[i]:
+            return None
+        return "long" if is_long[i] else "short"
+
+    return get_signal
+
+
+def run_excursion_probe(m, symbol, etf, split_ts, reg_map, strat_signal, max_bars, bar_min):
+    """Uji kualitas entry tanpa TP/BE: SL 1R (2 x ATR 1h) + time-stop, lalu hitung berapa trade
+    yang sempat bergerak +kR searah sebelum kena SL/time-stop. Sumber: 'strategi' vs 'acak'."""
+    cfg = {"sl_atr": MTF_SL_ATR, "sl_pct": None, "tp_r": None, "be_r": None,
+           "max_bars": max_bars, "roi": None, "bar_min": bar_min}
+    for source, sig in (("strategi", strat_signal), ("acak", make_random_signal(m))):
+        trades = _simulate_mtf(m, sig, True, cfg)
+        for t in trades:
+            t["regime"] = reg_map.get(pd.Timestamp(t["entry_ts"]) - pd.Timedelta(etf), "NONE")
+        for label in ("ALL", "TREND_UP", "TREND_DOWN", "RANGE"):
+            sub_t = trades if label == "ALL" else [t for t in trades if t["regime"] == label]
+            for side in ("long", "short"):
+                parts = split_by_period([t for t in sub_t if t["side"] == side], split_ts)
+                for period in ("IS", "OOS"):
+                    tr = parts[period]
+                    row = {"symbol": symbol, "timeframe": etf, "source": source, "regime": label,
+                           "side": side, "period": period, "n": len(tr)}
+                    for k in EXC_LEVELS:
+                        row[f"k{k:g}"] = sum(1 for t in tr if t["mfe_r"] >= k)
+                    EXC_ROWS.append(row)
+
+
 def run_mtf(exchange, all_results, raw_trades):
     """Jalankan MTF dalam dua versi biaya: net (ala Bitget: sudah dipotong fee + slippage,
     profit baru muncul setelah lewat BEP) dan gross (tanpa biaya). Selisihnya menunjukkan
@@ -972,6 +1033,8 @@ def _run_mtf_once(exchange, all_results, raw_trades, version):
                 REGIME_ROWS.extend(regime_forward_rows(m, symbol, etf, split_ts))
             reg_map = dict(zip(m["ts"], m["regime"]))
             get_signal = make_mtf_signal(m)
+            if version == "gross":
+                run_excursion_probe(m, symbol, etf, split_ts, reg_map, get_signal, max_bars, bar_min)
             if etf == FTS_TF:
                 run_freqtrade_batch(m, symbol, etf, split_ts, reg_map, all_results, suffix)
             for mode, allow_short in MODES.items():
@@ -1056,6 +1119,8 @@ def main():
     run_mtf(exchange, all_results, raw_trades)
     if REGIME_ROWS:
         pd.DataFrame(REGIME_ROWS).to_csv(OUTPUT_REGIME_CSV, index=False)
+    if EXC_ROWS:
+        pd.DataFrame(EXC_ROWS).to_csv(OUTPUT_EXC_CSV, index=False)
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
