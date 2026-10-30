@@ -54,12 +54,13 @@ TP_R = 1.5                   # TP tetap = TP_R x 1R dari entry (gross)
 # varian exit: nama -> (pakai trailing UT, pakai TP tetap)
 VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, True),
             "trail_be1": (True, False), "trail_be05": (True, False),
-            "trail_ema4h": (True, False)}
+            "trail_ema4h": (True, False),
+            "flip": (False, False)}   # flip: tanpa trailing/TP, keluar hanya di SL 1R atau sinyal balik (stop-and-reverse)
 # filter arah entry: long hanya kalau close sinyal > EMA200 4h, short hanya kalau <
 BIAS_VARIANTS = {"trail_ema4h"}
 EMA_N = 200
-RUN_VARIANTS = ["trail", "trail_ema4h"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
-UT_GRID = [(6, 10), (7, 10), (8, 10), (10, 10)]   # (a, periode ATR); (6, 10) = cek, harus mirip run sebelumnya
+RUN_VARIANTS = ["trail", "trail_ema4h", "flip"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
+UT_GRID = [(2, 1), (1, 1), (3, 1), (2, 3), (2, 10)]   # (a, periode ATR); (2, 1) = setelan chart TradingView, sisanya tetangga
 # BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
 BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
 BE_COST = COST_VERSIONS["net"]
@@ -522,7 +523,7 @@ def main():
                                 continue
                             trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname),
                                                  bias if vname in BIAS_VARIANTS else None)
-                            tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x)
+                            tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x) or "flip_UT"
                             for cost_name, cost in COST_VERSIONS.items():
                                 suffix = "" if cost_name == "net" else "_gross"
                                 name = f"UT_a{ua:g}_c{uc}_{session}_{vname}{suffix}"
