@@ -48,7 +48,11 @@ SESSIONS = ["24h", "free"]
 TP_R = 1.5                   # TP tetap = TP_R x 1R dari entry (gross)
 # varian exit: nama -> (pakai trailing UT, pakai TP tetap)
 VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, True),
-            "trail_be1": (True, False), "trail_be05": (True, False)}
+            "trail_be1": (True, False), "trail_be05": (True, False),
+            "trail_ema4h": (True, False)}
+# filter arah entry: long hanya kalau close sinyal > EMA200 4h, short hanya kalau <
+BIAS_VARIANTS = {"trail_ema4h"}
+EMA_N = 200
 # BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
 BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
 BE_COST = COST_VERSIONS["net"]
@@ -252,7 +256,7 @@ def apply_costs(trades, cost):
     return out
 
 
-def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None):
+def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -278,6 +282,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
                 nl, tr_sig, e = nloss[i - 1], stop[i - 1], o[i]
                 sign = 1 if pending == "long" else -1
                 ok = (nl > 0 and nl / e >= MIN_SL_PCT and not math.isnan(tr_sig)
+                      and (bias is None or bias[i - 1] == sign)  # filter arah EMA200 4h
                       and sign * (e - tr_sig) > 0                    # open belum melewati garis UT
                       and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN))
                 if ok:
@@ -325,6 +330,20 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
         elif sell[i]:
             pending = "short"
     return trades
+
+
+def htf_bias(df, df4):
+    """+1 / -1 / 0 per candle df: close candle itu di atas / di bawah EMA200 4h dari candle 4h
+    terakhir yang sudah close sebelum candle itu mulai (tanpa lookahead). 200 candle 4h awal = 0."""
+    ema = df4["close"].ewm(span=EMA_N, adjust=False).mean().to_numpy(copy=True)
+    ema[:EMA_N] = np.nan
+    t4 = (df4["ts"] + pd.Timedelta(hours=4)).dt.tz_convert(None).to_numpy("datetime64[ns]")
+    t = df["ts"].dt.tz_convert(None).to_numpy("datetime64[ns]")
+    idx = np.searchsorted(t4, t, side="right") - 1
+    e = np.where(idx >= 0, ema[np.clip(idx, 0, None)], np.nan)
+    c = df["close"].to_numpy(dtype=float)
+    with np.errstate(invalid="ignore"):
+        return np.where(c > e, 1, np.where(c < e, -1, 0))
 
 
 REASONS = {"stop_loss": "n_sl", "tp_fixed": "n_tp_fixed", "trail_win": "n_trail_win",
@@ -407,6 +426,10 @@ def main():
     exchange.load_markets()
     all_results = []
     for symbol in PAIRS:
+        df4 = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK)   # acuan bias EMA200 4h
+        if df4 is None or len(df4) <= EMA_N or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df4, "4h")):
+            print(f"  [!] Data 4h {symbol} tidak layak untuk bias EMA{EMA_N}, varian {sorted(BIAS_VARIANTS)} di-skip.")
+            df4 = None
         for tf in TIMEFRAMES:
             print(f"\n=== Fetching {symbol} {tf} ({DAYS_BACK} hari) ===")
             df = fetch_ohlcv_cached(exchange, symbol, tf, DAYS_BACK)
@@ -420,11 +443,15 @@ def main():
                 continue
 
             ut = ut_bot(df)
+            bias = htf_bias(df, df4) if df4 is not None else None
             split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
             for session in SESSIONS:
                 for mode, allow_short in MODES.items():
                     for vname, (trail_on, tp_on) in VARIANTS.items():
-                        trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname))
+                        if vname in BIAS_VARIANTS and bias is None:
+                            continue
+                        trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname),
+                                             bias if vname in BIAS_VARIANTS else None)
                         tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x)
                         for cost_name, cost in COST_VERSIONS.items():
                             suffix = "" if cost_name == "net" else "_gross"
