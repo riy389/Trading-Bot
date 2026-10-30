@@ -138,7 +138,7 @@ def regime_report(path="regime_forward.csv"):
 def ut_report(df):
     """UT BTC: hitungan exit per varian (gross, 2 tahun penuh) + PF IS/OOS."""
     d = df[df["strategy"].str.startswith("UT_") & df["strategy"].str.endswith("_gross")]
-    if d.empty:
+    if d.empty or d["symbol"].nunique() > 1:
         return ""
     keys = ["strategy", "timeframe"]
     cols = ["n_trades", "n_sl", "n_tp_fixed", "n_trail_win", "n_trail_loss", "n_be", "n_session", "n_reverse",
@@ -165,7 +165,7 @@ def ut_report(df):
 def mfe_report(df):
     """Dari trade rugi (gross, varian trail), berapa yang sebelumnya sempat untung >= 0.5R / 1R / 1.5R."""
     d = df[df["strategy"].str.startswith("UT_") & df["strategy"].str.endswith("_trail_gross") & (df["period"] == "full")]
-    if d.empty or "loss_mfe10" not in d.columns:
+    if d.empty or d["symbol"].nunique() > 1 or "loss_mfe10" not in d.columns:
         return ""
     t = d[["strategy", "timeframe", "n_trades", "n_loss", "loss_mfe05", "loss_mfe10", "loss_mfe15"]].copy()
     for c in ("05", "10", "15"):
@@ -179,10 +179,37 @@ def mfe_report(df):
             + t.round(1).to_string(index=False) + "\n```")
 
 
+def capital_report(path="capital_sim.csv"):
+    # Modal kecil (net, periode full), median antar pair. eqN = equity akhir USDT dgn risiko N%/trade (posisi dinaikkan ke min $5);
+    # ddN = max DD % median; skipN = % trade yang dilewati kalau posisi <$5 tidak dinaikkan; ruin10 = jumlah pair yang tak bisa buka posisi lagi (risiko 10%)
+    if not os.path.exists(path):
+        return ""
+    r = pd.read_csv(path)
+    key = ["strategy", "timeframe"]
+    m5 = r[r["policy"] == "min5"]
+    t = m5.pivot_table(index=key, columns="risk_pct", values="final_eq", aggfunc="median")
+    t.columns = [f"eq{int(c)}" for c in t.columns]
+    dd = m5[m5["risk_pct"].isin([5, 10])].pivot_table(index=key, columns="risk_pct", values="max_dd_pct", aggfunc="median")
+    dd.columns = [f"dd{int(c)}" for c in dd.columns]
+    sk = r[(r["policy"] == "skip") & r["risk_pct"].isin([1, 2])].copy()
+    sk["skip_pct"] = 100 * sk["n_skip"] / sk["n_trades"].replace(0, np.nan)
+    sk = sk.pivot_table(index=key, columns="risk_pct", values="skip_pct", aggfunc="median")
+    sk.columns = [f"skip{int(c)}" for c in sk.columns]
+    base = m5[m5["risk_pct"] == 1].groupby(key).agg(pairs=("symbol", "nunique"), n=("n_trades", "median"))
+    ruin = m5[m5["risk_pct"] == 10].groupby(key)["ruin"].sum().rename("ruin10")
+    t = base.join(t).join(dd).join(sk).join(ruin).reset_index()
+    t["strategy"] = t["strategy"].str.replace(r"^UT_a([^_]+)_c(\d+)_", r"\1/\2 ", regex=True)
+    t["timeframe"] = pd.Categorical(t["timeframe"], ["5m", "15m", "1h", "4h"], ordered=True)
+    t = t.sort_values(["timeframe", "strategy"])
+    return ("\n### Simulasi modal $10 (net, full). eqN = equity akhir USDT di risiko N%/trade, posisi dinaikkan ke min $5;"
+            " ddN = max DD % ; skipN = % trade dilewati kalau tidak dinaikkan; ruin10 = pair yang mati di risiko 10%. Median antar pair\n```\n"
+            + t.round(1).to_string(index=False) + "\n```")
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else CSV
     df = load(path)
-    text = render(evaluate(df)) + ut_report(df) + mfe_report(df) + mtf_report(df) + regime_report() + excursion_report()
+    text = render(evaluate(df)) + ut_report(df) + mfe_report(df) + mtf_report(df) + regime_report() + excursion_report() + capital_report()
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

@@ -28,8 +28,13 @@ import math
 from datetime import datetime, timedelta, timezone
 
 # ============== KONFIGURASI ==============
-PAIRS = ["BTC/USDT:USDT"]  # Bitget perpetual swap (sementara 1 pair; 12 pair ada di git history)
-TIMEFRAMES = ["5m", "15m", "1h", "4h"]
+PAIRS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+    "BNB/USDT:USDT", "XRP/USDT:USDT", "DOGE/USDT:USDT",
+    "ADA/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT",
+    "LTC/USDT:USDT", "DOT/USDT:USDT", "TRX/USDT:USDT",
+]  # Bitget perpetual swap, 12 pair
+TIMEFRAMES = ["15m", "1h", "4h"]   # 5m dibuang (netR negatif di semua A)
 DAYS_BACK_TF = {"5m": 365 * 2, "15m": 365 * 2, "1h": 365 * 5, "4h": 365 * 5}   # hari data per timeframe
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
 ROUND_TRIP_FEE = TAKER_FEE * 2
@@ -54,7 +59,7 @@ VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, 
 BIAS_VARIANTS = {"trail_ema4h"}
 EMA_N = 200
 RUN_VARIANTS = ["trail", "trail_ema4h"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
-UT_GRID = [(3, 10), (4, 10), (5, 10), (6, 10)]   # (a, periode ATR); (3, 10) = baseline run sebelumnya
+UT_GRID = [(6, 10), (7, 10), (8, 10), (10, 10)]   # (a, periode ATR); (6, 10) = cek, harus mirip run sebelumnya
 # BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
 BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
 BE_COST = COST_VERSIONS["net"]
@@ -67,6 +72,12 @@ MAX_GAP_CANDLES = 3          # gap data lebih besar -> pair/timeframe di-skip
 CACHE_DIR = "cache"
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
+OUTPUT_CAP = "capital_sim.csv"
+# simulasi modal kecil (versi net, periode full)
+CAP_START = 10.0             # modal awal (USDT) per pair
+CAP_MIN_NOTIONAL = 5.0       # order minimum (nilai posisi, USDT)
+CAP_MAX_LEV = 10.0           # leverage maksimum
+CAP_RISKS = [0.01, 0.02, 0.05, 0.10]   # risiko per trade (% ekuitas) yang diuji
 # ===========================================
 
 def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None, until_ms=None):
@@ -416,6 +427,35 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
     }
 
 
+def capital_sim(trades, name, symbol, tf):
+    # Modal kecil, compounding. Posisi = ekuitas x risiko / jarak SL (maks CAP_MAX_LEV x ekuitas).
+    # skip: trade dilewati kalau posisi < CAP_MIN_NOTIONAL. min5: posisi dinaikkan ke CAP_MIN_NOTIONAL
+    # (risiko riil jadi lebih besar dari yang diminta). pnl = posisi x sl_pct x net_R (net_R sudah memuat biaya).
+    rows = []
+    for risk in CAP_RISKS:
+        for policy in ("skip", "min5"):
+            eq = peak = lo = CAP_START
+            dd = 0.0
+            n_exec = n_skip = 0
+            for t in trades:
+                notional = min(eq * risk / t["sl_pct"], eq * CAP_MAX_LEV)
+                if notional < CAP_MIN_NOTIONAL:
+                    if policy == "min5" and eq * CAP_MAX_LEV >= CAP_MIN_NOTIONAL:
+                        notional = CAP_MIN_NOTIONAL
+                    else:
+                        n_skip += 1
+                        continue
+                eq = max(eq + notional * t["sl_pct"] * t["net_R"], 0.0)
+                n_exec += 1
+                peak, lo = max(peak, eq), min(lo, eq)
+                dd = min(dd, eq / peak - 1)
+            rows.append({"strategy": name, "symbol": symbol, "timeframe": tf, "risk_pct": round(risk * 100, 1),
+                         "policy": policy, "n_trades": len(trades), "n_exec": n_exec, "n_skip": n_skip,
+                         "final_eq": round(eq, 2), "min_eq": round(lo, 2), "max_dd_pct": round(dd * 100, 1),
+                         "ruin": int(eq * CAP_MAX_LEV < CAP_MIN_NOTIONAL)})
+    return rows
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -426,7 +466,7 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
-    all_results = []
+    all_results, cap_rows = [], []
     for symbol in PAIRS:
         df4 = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK_TF["4h"])   # acuan bias EMA200 4h
         if df4 is None or len(df4) <= EMA_N or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df4, "4h")):
@@ -461,7 +501,10 @@ def main():
                             for cost_name, cost in COST_VERSIONS.items():
                                 suffix = "" if cost_name == "net" else "_gross"
                                 name = f"UT_a{ua:g}_c{uc}_{session}_{vname}{suffix}"
-                                for period, tr in split_by_period(apply_costs(trades, cost), split_ts).items():
+                                costed = apply_costs(trades, cost)
+                                if cost_name == "net":
+                                    cap_rows += capital_sim(costed, name, symbol, tf)
+                                for period, tr in split_by_period(costed, split_ts).items():
                                     all_results.append(compute_metrics(
                                         tr, name, symbol, tf, "SL1R_fixed", tp_label, period, mode))
 
@@ -473,6 +516,8 @@ def main():
     df_summary = pd.DataFrame(all_results)
     df_summary = df_summary.sort_values(["timeframe", "strategy", "mode", "symbol", "period"])
     df_summary.to_csv(OUTPUT_CSV, index=False)
+    if cap_rows:
+        pd.DataFrame(cap_rows).to_csv(OUTPUT_CAP, index=False)
     print("\n" + "=" * 100)
     print(df_summary.to_string(index=False))
     print(f"\nDisimpan ke: {OUTPUT_CSV} dan {OUTPUT_JSON}")

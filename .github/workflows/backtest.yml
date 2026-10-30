@@ -40,4 +40,5 @@ jobs:
           path: |
             results_summary.csv
             results.json
+            capital_sim.csv
           if-no-files-found: warn
