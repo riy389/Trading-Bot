@@ -153,7 +153,7 @@ def ut_report(df):
     nt = nt.set_index(keys)[["profit_factor", "avg_net_R"]]
     t["pf_net"], t["netR"] = nt["profit_factor"], nt["avg_net_R"]
     t = t.reset_index()
-    t["strategy"] = t["strategy"].str.replace(r"^UT_a[^_]+_c\d+_", "", regex=True).str.replace("_gross", "", regex=False)
+    t["strategy"] = t["strategy"].str.replace(r"^UT_a([^_]+)_c(\d+)_", r"\1/\2 ", regex=True).str.replace("_gross", "", regex=False)
     t["timeframe"] = pd.Categorical(t["timeframe"], ["5m", "15m", "1h", "4h"], ordered=True)
     t = t.sort_values(["strategy", "timeframe"]).rename(columns={
         "n_trades": "n", "n_sl": "sl", "n_tp_fixed": "tp", "n_trail_win": "trW", "n_trail_loss": "trL", "n_be": "be",
@@ -170,7 +170,7 @@ def mfe_report(df):
     t = d[["strategy", "timeframe", "n_trades", "n_loss", "loss_mfe05", "loss_mfe10", "loss_mfe15"]].copy()
     for c in ("05", "10", "15"):
         t["pct" + c] = 100 * t["loss_mfe" + c] / t["n_loss"]
-    t["strategy"] = t["strategy"].str.replace(r"^UT_a[^_]+_c\d+_", "", regex=True).str.replace("_gross", "", regex=False)
+    t["strategy"] = t["strategy"].str.replace(r"^UT_a([^_]+)_c(\d+)_", r"\1/\2 ", regex=True).str.replace("_gross", "", regex=False)
     t["timeframe"] = pd.Categorical(t["timeframe"], ["5m", "15m", "1h", "4h"], ordered=True)
     t = t.sort_values(["strategy", "timeframe"]).rename(columns={
         "n_trades": "n", "n_loss": "rugi", "loss_mfe05": "m05", "loss_mfe10": "m10", "loss_mfe15": "m15"})

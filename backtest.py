@@ -53,6 +53,8 @@ VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, 
 # filter arah entry: long hanya kalau close sinyal > EMA200 4h, short hanya kalau <
 BIAS_VARIANTS = {"trail_ema4h"}
 EMA_N = 200
+RUN_VARIANTS = ["trail", "trail_ema4h"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
+UT_GRID = [(1, 10), (1, 1), (2, 10), (1, 34), (3, 10)]   # (a, periode ATR); (1, 10) = baseline
 # BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
 BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
 BE_COST = COST_VERSIONS["net"]
@@ -442,23 +444,26 @@ def main():
                 print(f"  [!] {len(big_gaps)} gap besar (> {MAX_GAP_CANDLES} candle) di {symbol} {tf}, skip.")
                 continue
 
-            ut = ut_bot(df)
-            bias = htf_bias(df, df4) if df4 is not None else None
-            split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
-            for session in SESSIONS:
-                for mode, allow_short in MODES.items():
-                    for vname, (trail_on, tp_on) in VARIANTS.items():
-                        if vname in BIAS_VARIANTS and bias is None:
-                            continue
-                        trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname),
-                                             bias if vname in BIAS_VARIANTS else None)
-                        tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x)
-                        for cost_name, cost in COST_VERSIONS.items():
-                            suffix = "" if cost_name == "net" else "_gross"
-                            name = f"UT_a{UT_A:g}_c{UT_C}_{session}_{vname}{suffix}"
-                            for period, tr in split_by_period(apply_costs(trades, cost), split_ts).items():
-                                all_results.append(compute_metrics(
-                                    tr, name, symbol, tf, "SL1R_fixed", tp_label, period, mode))
+            for ua, uc in UT_GRID:
+                ut = ut_bot(df, ua, uc)
+                bias = htf_bias(df, df4) if df4 is not None else None
+                split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+                for session in SESSIONS:
+                    for mode, allow_short in MODES.items():
+                        for vname, (trail_on, tp_on) in VARIANTS.items():
+                            if vname not in RUN_VARIANTS:
+                                continue
+                            if vname in BIAS_VARIANTS and bias is None:
+                                continue
+                            trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname),
+                                                 bias if vname in BIAS_VARIANTS else None)
+                            tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x)
+                            for cost_name, cost in COST_VERSIONS.items():
+                                suffix = "" if cost_name == "net" else "_gross"
+                                name = f"UT_a{ua:g}_c{uc}_{session}_{vname}{suffix}"
+                                for period, tr in split_by_period(apply_costs(trades, cost), split_ts).items():
+                                    all_results.append(compute_metrics(
+                                        tr, name, symbol, tf, "SL1R_fixed", tp_label, period, mode))
 
     if not all_results:
         raise SystemExit("[!] Tidak ada pair/timeframe yang lolos validasi data, tidak ada hasil untuk disimpan.")
