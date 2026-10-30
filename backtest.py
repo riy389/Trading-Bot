@@ -8,7 +8,7 @@ Tahap 1 = port persis (a=1, ATR 10, tanpa Heikin Ashi). Tuning baru setelah hasi
 Aturan eksekusi:
 - Sinyal (buy/sell UT) dihitung di CLOSE candle i, entry di OPEN candle i+1.
 - 1R = jarak SL = UT_A x ATR candle sinyal. Ukuran posisi = RISK_PER_TRADE / jarak SL (persen),
-  TANPA fee di dalamnya dan tanpa batas leverage, supaya rugi di SL selalu -1R (gross).
+  TANPA fee di dalamnya dan leverage dibatasi lewat MIN_SL_PCT (entry dengan SL lebih ketat dilewati, bukan diperkecil), supaya rugi di SL selalu -1R (gross).
 - Exit hanya lewat SL tetap (1R) atau trailing TP (garis trailing stop UT dari candle
   sebelumnya), dicek intrabar pakai low/high. Gap -> fill di open. Sinyal berlawanan saat posisi
   masih hidup: tutup di open lalu buka arah baru.
@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 # ============== KONFIGURASI ==============
 PAIRS = ["BTC/USDT:USDT"]  # Bitget perpetual swap (sementara 1 pair; 12 pair ada di git history)
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
-DAYS_BACK = 365 * 2          # 2 tahun data
+DAYS_BACK_TF = {"5m": 365 * 2, "15m": 365 * 2, "1h": 365 * 5, "4h": 365 * 5}   # hari data per timeframe
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
 ROUND_TRIP_FEE = TAKER_FEE * 2
 SLIPPAGE = 0.0005            # 0.05% per sisi
@@ -42,7 +42,7 @@ UT_C = 10                    # ATR period
 UT_HA = False                # sinyal dari close Heikin Ashi
 
 RISK_PER_TRADE = 0.01        # 1R = 1% ekuitas
-MIN_SL_PCT = 0.0             # jarak SL minimum (% harga); 0 = mati
+MIN_SL_PCT = 0.001           # jarak SL minimum (% harga) = batas leverage 10x (RISK_PER_TRADE / MIN_SL_PCT)
 
 SESSIONS = ["24h", "free"]
 TP_R = 1.5                   # TP tetap = TP_R x 1R dari entry (gross)
@@ -428,13 +428,13 @@ def main():
     exchange.load_markets()
     all_results = []
     for symbol in PAIRS:
-        df4 = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK)   # acuan bias EMA200 4h
+        df4 = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK_TF["4h"])   # acuan bias EMA200 4h
         if df4 is None or len(df4) <= EMA_N or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df4, "4h")):
             print(f"  [!] Data 4h {symbol} tidak layak untuk bias EMA{EMA_N}, varian {sorted(BIAS_VARIANTS)} di-skip.")
             df4 = None
         for tf in TIMEFRAMES:
-            print(f"\n=== Fetching {symbol} {tf} ({DAYS_BACK} hari) ===")
-            df = fetch_ohlcv_cached(exchange, symbol, tf, DAYS_BACK)
+            print(f"\n=== Fetching {symbol} {tf} ({DAYS_BACK_TF[tf]} hari) ===")
+            df = fetch_ohlcv_cached(exchange, symbol, tf, DAYS_BACK_TF[tf])
             if df is None or len(df) < 100:
                 print(f"  [!] Data tidak cukup untuk {symbol} {tf}, skip.")
                 continue
