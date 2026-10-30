@@ -54,7 +54,7 @@ VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, 
 BIAS_VARIANTS = {"trail_ema4h"}
 EMA_N = 200
 RUN_VARIANTS = ["trail", "trail_ema4h"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
-UT_GRID = [(1, 10), (1, 1), (2, 10), (1, 34), (3, 10)]   # (a, periode ATR); (1, 10) = baseline
+UT_GRID = [(3, 10), (4, 10), (5, 10), (6, 10)]   # (a, periode ATR); (3, 10) = baseline run sebelumnya
 # BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
 BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
 BE_COST = COST_VERSIONS["net"]
