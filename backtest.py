@@ -73,6 +73,7 @@ CACHE_DIR = "cache"
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
 OUTPUT_CAP = "capital_sim.csv"
+CHECK_UT = [(2, 1), (1, 10)]   # (a, periode ATR) untuk cek sinyal vs chart TradingView
 # simulasi modal kecil (versi net, periode full)
 CAP_START = 10.0             # modal awal (USDT) per pair
 CAP_MIN_NOTIONAL = 5.0       # order minimum (nilai posisi, USDT)
@@ -427,6 +428,27 @@ def compute_metrics(trades, strategy_name, symbol, timeframe, sl_label, tp_label
     }
 
 
+def check_signals(exchange):
+    # Cek cepat: sinyal port UT vs chart TradingView. Waktu WIB = waktu BUKA candle. Candle terakhir belum close.
+    lines = []
+    for tf, days in (("15m", 3), ("4h", 40)):
+        df = fetch_ohlcv(exchange, PAIRS[0], tf, days)
+        if df is None:
+            continue
+        for a, c in CHECK_UT:
+            _, buy, sell, nl = ut_bot(df, a, c)
+            t = df.assign(buy=buy, sell=sell, wib=(df["ts"] + pd.Timedelta(hours=7)).dt.tz_localize(None))
+            t = t[t["buy"] | t["sell"]][["wib", "close", "buy", "sell"]].tail(8)
+            lines.append(f"\n### Cek sinyal UT a={a} c={c} {tf} | R terakhir (a x ATR) = {nl[-1]:.0f}\n```\n"
+                         + t.to_string(index=False) + "\n```")
+    text = "\n".join(lines)
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(text + "\n")
+
+
 def capital_sim(trades, name, symbol, tf):
     # Modal kecil, compounding. Posisi = ekuitas x risiko / jarak SL (maks CAP_MAX_LEV x ekuitas).
     # skip: trade dilewati kalau posisi < CAP_MIN_NOTIONAL. min5: posisi dinaikkan ke CAP_MIN_NOTIONAL
@@ -466,6 +488,9 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
+    check_signals(exchange)
+    if os.environ.get("CHECK_ONLY") == "1":
+        return
     all_results, cap_rows = [], []
     for symbol in PAIRS:
         df4 = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK_TF["4h"])   # acuan bias EMA200 4h

@@ -2,6 +2,11 @@ name: Run Backtest
 
 on:
   workflow_dispatch:  # klik tombol "Run workflow" manual di tab Actions
+    inputs:
+      check_only:
+        description: "Cek sinyal UT saja (tanpa backtest)"
+        type: boolean
+        default: false
 
 jobs:
   backtest:
@@ -28,8 +33,11 @@ jobs:
 
       - name: Run backtest
         run: python3 backtest.py
+        env:
+          CHECK_ONLY: ${{ inputs.check_only && '1' || '0' }}
 
       - name: Evaluate results
+        if: ${{ !inputs.check_only }}
         run: python3 evaluate.py
 
       - name: Upload results
