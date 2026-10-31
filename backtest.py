@@ -278,7 +278,7 @@ def apply_costs(trades, cost):
 
 
 def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None,
-                be_cost=BE_COST, lock=None):
+                be_cost=BE_COST, lock=None, close_end=False):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -356,6 +356,8 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
             pending = "long"
         elif sell[i]:
             pending = "short"
+    if close_end and pos is not None:
+        trades.append(_close(pos, tss[-1], float(df["close"].iloc[-1]), "end_data"))
     return trades
 
 
@@ -558,7 +560,7 @@ def trade_reports(tr):
 
 
 # ---------- Tes SL = TP tetap 1% harga (BTC); candle yang kena SL dan TP sekaligus dicek di 1m ----------
-FIXED_RR = True              # True: main() hanya menjalankan tes ini lalu selesai (False = backtest lama)
+FIXED_RR = False             # True: main() hanya menjalankan tes ini lalu selesai (False = backtest lama)
 FRR_PCT = 0.01               # SL = TP = 1% harga dari entry (= 1R)
 FRR_COSTS = {"009": 0.0009, "022": 0.0022}   # biaya round-trip (% nilai posisi), dipotong di luar strategi
 FRR_SYMBOL = "BTC/USDT:USDT"
@@ -686,6 +688,166 @@ def run_fixed_rr(exchange):
           "unres = data 1m tidak ada (-> SL)\n" + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
 
 
+# ---------- Swing 4h: funding, akun gabungan 12 pair, kriteria pooled ----------
+SWING = True                 # True: main() hanya menjalankan tes swing lalu selesai
+SW_GRID = [(a, 10) for a in range(1, 8)]   # A 1..7, ATR 10 (tetangga = A +/- 1)
+SW_ACC_A = [2, 6]            # A yang dijalankan di simulasi akun gabungan
+SW_CAPS = [10.0, 100.0, 1000.0]
+SW_RISKS = [0.01, 0.02, 0.05, 0.10]
+SW_MAX_LEV = 10.0            # leverage total maksimum (jumlah nilai posisi / ekuitas)
+SW_PF, SW_N = 1.2, 30        # kriteria lulus pooled, berlaku per paruh (IS dan OOS)
+
+
+def fetch_funding(exchange, symbol, days_back):
+    """Riwayat funding rate (cache CSV). Return (ts_ms, rate) urut naik. Gagal -> array kosong."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{symbol.split(':')[0].replace('/', '_')}_funding.csv")
+    old = pd.read_csv(path) if os.path.exists(path) else pd.DataFrame(columns=["ts", "rate"])
+    want = int((pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days_back)).timestamp() * 1000)
+    have_max = int(old["ts"].max()) if len(old) else 0
+    rows, page, prev_oldest = [], 1, None
+    while page <= 100:
+        try:
+            r = exchange.fetch_funding_rate_history(symbol, None, 100, {"pageNo": page})
+        except Exception as e:
+            print(f"  [!] funding {symbol} hal {page}: {e}")
+            break
+        if not r:
+            break
+        rows += [(int(x["timestamp"]), float(x["fundingRate"])) for x in r]
+        oldest = min(int(x["timestamp"]) for x in r)
+        if oldest <= want or oldest <= have_max or oldest == prev_oldest:
+            break
+        prev_oldest = oldest
+        page += 1
+        time.sleep(exchange.rateLimit / 1000)
+    df = pd.concat([old, pd.DataFrame(rows, columns=["ts", "rate"])]).drop_duplicates(subset="ts").sort_values("ts")
+    df.to_csv(path, index=False)
+    return df["ts"].to_numpy(dtype="int64"), df["rate"].to_numpy(dtype=float)
+
+
+def attach_funding(trades, f_ts, f_rate):
+    """Funding per trade (dalam R): tiap penyelesaian funding setelah entry sampai exit; long membayar saat rate positif,
+    short menerima. Trade di luar rentang data funding -> funding 0 dan cov=False."""
+    cs = np.r_[0.0, np.cumsum(f_rate)]
+    for t in trades:
+        e = pd.Timestamp(t["entry_ts"]).timestamp() * 1000
+        x = pd.Timestamp(t["exit_ts"]).timestamp() * 1000
+        sign = 1 if t["side"] == "long" else -1
+        cov = len(f_ts) > 0 and f_ts[0] <= e and f_ts[-1] >= x
+        s = cs[np.searchsorted(f_ts, x, "right")] - cs[np.searchsorted(f_ts, e, "right")] if cov else 0.0
+        t["fund_R"] = sign * s / t["sl_pct"]
+        t["net_R_f"] = t["net_R"] - t["fund_R"]
+        t["cov"] = bool(cov)
+        t["_e"], t["_x"] = e, x
+
+
+def swing_account(trades, cap0, risk, policy):
+    """Satu equity untuk semua pair. Posisi = ekuitas terealisasi x risiko / jarak SL, satu posisi per pair (sudah dari
+    simulate_ut). Entry dilewati kalau total nilai posisi akan melewati SW_MAX_LEV x ekuitas (skip_lev) atau posisi
+    < CAP_MIN_NOTIONAL pada kebijakan 'skip' (skip_min); 'min5' menaikkan ke minimum. Ekuitas hanya diperbarui saat exit
+    (rugi mengambang tidak dihitung, jadi DD sedikit terlalu rendah)."""
+    ev = []
+    for k, t in enumerate(trades):
+        ev.append((t["_e"], 0, k))
+        ev.append((t["_x"], -1 if t["exit_reason"] == "reverse" else 1, k))
+    ev.sort()
+    eq = peak = cap0
+    dd = 0.0
+    open_n, n_exec, n_min, n_lev = {}, 0, 0, 0
+    for _, typ, k in ev:
+        t = trades[k]
+        if typ == 0:
+            if eq * SW_MAX_LEV < CAP_MIN_NOTIONAL:
+                continue
+            notional = eq * risk / t["sl_pct"]
+            if notional < CAP_MIN_NOTIONAL:
+                if policy == "min5":
+                    notional = CAP_MIN_NOTIONAL
+                else:
+                    n_min += 1
+                    continue
+            if sum(open_n.values()) + notional > eq * SW_MAX_LEV:
+                n_lev += 1
+                continue
+            open_n[k] = notional
+            n_exec += 1
+        elif k in open_n:
+            eq = max(eq + open_n.pop(k) * t["sl_pct"] * t["net_R_f"], 0.0)
+            peak = max(peak, eq)
+            dd = min(dd, eq / peak - 1)
+    return {"final_eq": round(eq, 2), "max_dd_pct": round(dd * 100, 1), "n_exec": n_exec,
+            "skip_min": n_min, "skip_lev": n_lev, "ruin": int(eq * SW_MAX_LEV < CAP_MIN_NOTIONAL)}
+
+
+def sw_pf(r):
+    pos, neg = r[r > 0].sum(), -r[r < 0].sum()
+    return round(float(pos / neg), 2) if neg > 0 else float("inf")
+
+
+def sw_row(a, trs):
+    if not trs:
+        return {"A": a, "n": 0, "n_IS": 0, "n_OOS": 0, "pf_IS": None, "pf_OOS": None,
+                "netR_IS": None, "netR_OOS": None, "netR_full": 0.0}
+    df = pd.DataFrame(trs)
+    row = {"A": a, "n": len(df), "pairs_pos": int((df.groupby("symbol")["net_R_f"].mean() > 0).sum()),
+           "netR_nofund": round(float(df["net_R"].mean()), 3), "fund_R": round(float(df["fund_R"].mean()), 3),
+           "cov%": round(float(df["cov"].mean() * 100), 1)}
+    for h in ("IS", "OOS"):
+        g = df.loc[df["half"] == h, "net_R_f"]
+        row["n_" + h] = len(g)
+        row["pf_" + h] = sw_pf(g) if len(g) else None
+        row["netR_" + h] = round(float(g.mean()), 3) if len(g) else None
+    row["netR_full"] = round(float(df["net_R_f"].mean()), 3)
+    return row
+
+
+def sw_pass(r, rows):
+    for h in ("IS", "OOS"):
+        if r["n_" + h] < SW_N or r["pf_" + h] is None or r["pf_" + h] < SW_PF or r["netR_" + h] is None or r["netR_" + h] <= 0:
+            return False
+    return all(x["netR_full"] > 0 for x in rows if abs(x["A"] - r["A"]) == 1)
+
+
+def run_swing(exchange):
+    per_a = {a: [] for a, _ in SW_GRID}
+    for symbol in PAIRS:
+        print(f"\n=== Swing {symbol} 4h ===")
+        df = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK_TF["4h"])
+        if df is None or len(df) <= EMA_N or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, "4h")):
+            print(f"  [!] Data 4h {symbol} tidak layak, skip.")
+            continue
+        f_ts, f_rate = fetch_funding(exchange, symbol, DAYS_BACK_TF["4h"])
+        print(f"  funding: {len(f_ts)} catatan")
+        bias = htf_bias(df, df)
+        split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+        cost = net_cost(symbol)
+        for ua, uc in SW_GRID:
+            trades = simulate_ut(df, ut_bot(df, ua, uc), "free", True, True, False, None, bias,
+                                 be_cost=cost, close_end=True)
+            costed = apply_costs(trades, cost)
+            attach_funding(costed, f_ts, f_rate)
+            for t in costed:
+                t["symbol"], t["A"] = symbol, ua
+                t["half"] = "IS" if t["entry_ts"] < str(split_ts) else "OOS"
+            per_a[ua] += costed
+    rows = [sw_row(a, per_a[a]) for a, _ in SW_GRID]
+    for r in rows:
+        r["LULUS"] = int(sw_pass(r, rows))
+    acc = [{"A": a, "modal": cap, "risk%": round(rk * 100, 1), "policy": pol, **swing_account(per_a[a], cap, rk, pol)}
+           for a in SW_ACC_A for cap in SW_CAPS for rk in SW_RISKS for pol in ("skip", "min5")]
+    pd.DataFrame([{k: v for k, v in t.items() if not k.startswith("_")} for a in per_a for t in per_a[a]]).to_csv(
+        "trades_swing.csv", index=False)
+    fence = "`" * 3
+    _emit("\n### Swing 4h free trail_ema4h, 12 pair pooled, net setelah funding. netR_nofund = sebelum funding, fund_R = "
+          "rata-rata funding per trade (R), cov% = trade yang tercakup data funding, pairs_pos = pair dengan netR_full > 0. "
+          f"LULUS = PF IS dan OOS >= {SW_PF}, n >= {SW_N} per paruh, netR > 0 per paruh, dan A tetangga netR_full > 0\n"
+          + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
+    _emit("\n### Akun gabungan (satu equity, leverage total maks " + f"{SW_MAX_LEV:g}x, posisi min ${CAP_MIN_NOTIONAL:g}). "
+          "skip_min = dilewati karena posisi < minimum, skip_lev = dilewati karena batas leverage total\n"
+          + fence + "\n" + pd.DataFrame(acc).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -701,6 +863,9 @@ def main():
         return
     if FIXED_RR:
         run_fixed_rr(exchange)
+        return
+    if SWING:
+        run_swing(exchange)
         return
     all_results, cap_rows, trade_rows = [], [], []
     for symbol in PAIRS:
