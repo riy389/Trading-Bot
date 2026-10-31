@@ -354,7 +354,8 @@ def evaluate_eth(summary_path="eth_momentum_summary.json",
     ]
 
     report = "\n".join(lines) + "\n"
-    Path("eth_momentum_evaluation.md").write_text(report)
+    with open("eth_momentum_evaluation.md", "w", encoding="utf-8") as f:
+        f.write(report)
     print(report)
 
     github_summary = os.environ.get("GITHUB_STEP_SUMMARY")
