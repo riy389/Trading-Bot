@@ -29,6 +29,9 @@ jobs:
       - name: Run ETH Momentum Breakout
         run: python3 backtestgpt.py
 
+      - name: Evaluate ETH Momentum Breakout
+        run: python3 evaluate.py --eth
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
@@ -37,4 +40,5 @@ jobs:
           path: |
             eth_momentum_summary.json
             eth_momentum_trades.csv
+            eth_momentum_evaluation.md
           if-no-files-found: warn

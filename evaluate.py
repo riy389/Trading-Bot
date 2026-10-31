@@ -7,6 +7,7 @@ Satu pair LULUS untuk sebuah kombinasi (strategi, mode, timeframe, SL) kalau:
 Kombinasi LULUS kalau mayoritas pair (> 50%) lulus.
 Output dicetak ke stdout dan ditambahkan ke $GITHUB_STEP_SUMMARY kalau ada.
 """
+import json
 import os
 import sys
 import numpy as np
@@ -206,7 +207,163 @@ def capital_report(path="capital_sim.csv"):
             + t.round(1).to_string(index=False) + "\n```")
 
 
-def main():
+
+def evaluate_eth(summary_path="eth_momentum_summary.json",
+                 trades_path="eth_momentum_trades.csv"):
+    """Evaluate ETH Momentum Breakout and publish a GitHub Actions summary."""
+    with open(summary_path) as f:
+        meta = json.load(f)
+
+    df = pd.read_csv(trades_path)
+    if not df.empty:
+        df = df.sort_values("entry_ts").reset_index(drop=True)
+        df["return_pct"] = pd.to_numeric(df["return_pct"], errors="coerce")
+        df = df.dropna(subset=["return_pct"])
+
+    n = len(df)
+    wins = df[df["return_pct"] > 0]["return_pct"] if n else pd.Series(dtype=float)
+    losses = df[df["return_pct"] <= 0]["return_pct"] if n else pd.Series(dtype=float)
+
+    gross_profit = wins.sum()
+    gross_loss = abs(losses.sum())
+    pf = gross_profit / gross_loss if gross_loss else float("inf")
+    wr = len(wins) / n * 100 if n else 0
+    total_return = ((1 + df["return_pct"] / 100).prod() - 1) * 100 if n else 0
+
+    if n:
+        equity = (1 + df["return_pct"] / 100).cumprod()
+        max_dd = ((equity / equity.cummax()) - 1).min() * 100
+    else:
+        max_dd = 0
+
+    avg_win = wins.mean() if len(wins) else 0
+    avg_loss = losses.mean() if len(losses) else 0
+    payoff = avg_win / abs(avg_loss) if avg_loss else float("inf")
+
+    def fmt(value, digits=2):
+        if value == float("inf"):
+            return "∞"
+        return f"{value:.{digits}f}"
+
+    lines = [
+        "# ETH Momentum Breakout — Evaluasi Backtest",
+        "",
+        f"**Pair:** {meta.get('symbol', 'ETH/USDT:USDT')}  ",
+        f"**Timeframe:** {meta.get('timeframe', '2h')}  ",
+        f"**Data candle:** {meta.get('period_start', '?')} → {meta.get('period_end', '?')}  ",
+        f"**Jumlah candle:** {meta.get('candles', '?')}  ",
+        "",
+        "## Ringkasan performa",
+        "",
+        "| Metrik | Hasil |",
+        "|---|---:|",
+        f"| Total trade | {n} |",
+        f"| Win rate | {fmt(wr)}% |",
+        f"| Profit factor | {fmt(pf)} |",
+        f"| Compounded return | {fmt(total_return)}% |",
+        f"| Max drawdown (equity per trade) | {fmt(max_dd)}% |",
+        f"| Average win | {fmt(avg_win)}% |",
+        f"| Average loss | {fmt(avg_loss)}% |",
+        f"| Average win/loss ratio | {fmt(payoff)} |",
+        "",
+        "## Exit reason",
+        "",
+        "| Exit | Jumlah |",
+        "|---|---:|",
+    ]
+
+    if n:
+        for name, count in df["exit_reason"].value_counts().items():
+            lines.append(f"| {name} | {count} |")
+    else:
+        lines.append("| Tidak ada trade | 0 |")
+
+    lines += [
+        "",
+        "## Hasil per tahun",
+        "",
+        "| Tahun | Trade | Win rate | PF | Return compounded |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+
+    if n:
+        df["year"] = pd.to_datetime(df["entry_ts"], utc=True).dt.year
+        for year, group in df.groupby("year"):
+            w = group[group["return_pct"] > 0]["return_pct"]
+            l = group[group["return_pct"] <= 0]["return_pct"]
+            gp, gl = w.sum(), abs(l.sum())
+            year_pf = gp / gl if gl else float("inf")
+            year_return = ((1 + group["return_pct"] / 100).prod() - 1) * 100
+            year_wr = len(w) / len(group) * 100
+            lines.append(
+                f"| {year} | {len(group)} | {fmt(year_wr)}% | "
+                f"{fmt(year_pf)} | {fmt(year_return)}% |"
+            )
+    else:
+        lines.append("| - | 0 | - | - | - |")
+
+    lines += [
+        "",
+        "## Hasil berdasarkan regime",
+        "",
+        "| Regime | Trade | Win rate | PF | Avg return/trade |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+
+    if n and "regime" in df.columns:
+        for regime, group in df.groupby("regime"):
+            w = group[group["return_pct"] > 0]["return_pct"]
+            l = group[group["return_pct"] <= 0]["return_pct"]
+            gp, gl = w.sum(), abs(l.sum())
+            regime_pf = gp / gl if gl else float("inf")
+            regime_wr = len(w) / len(group) * 100
+            avg_ret = group["return_pct"].mean()
+            label = {1: "HOT", 0: "NORMAL", -1: "COLD"}.get(
+                int(regime), str(regime)
+            )
+            lines.append(
+                f"| {label} | {len(group)} | {fmt(regime_wr)}% | "
+                f"{fmt(regime_pf)} | {fmt(avg_ret)}% |"
+            )
+    else:
+        lines.append("| - | 0 | - | - | - |")
+
+    lines += [
+        "",
+        "## Pembanding README",
+        "",
+        "| Metrik | README | Hasil backtest ini |",
+        "|---|---:|---:|",
+        f"| Return | +197% | {fmt(total_return)}% |",
+        f"| Profit factor | 3.08 | {fmt(pf)} |",
+        f"| Win rate | 56% | {fmt(wr)}% |",
+        f"| Max drawdown | sekitar 14% | {fmt(abs(max_dd))}% |",
+        "",
+        "> Angka README adalah angka referensi, bukan kriteria kelulusan otomatis. "
+        "Perbandingan harus memperhatikan kesamaan data, periode, dan asumsi eksekusi.",
+        "",
+        "## Catatan validitas",
+        "",
+        "- Backtest ini menggunakan pendekatan OHLC, bukan tick replay.",
+        "- Belum ada pemisahan IS/OOS pada laporan ini.",
+        "- Max drawdown dihitung dari equity berurutan per trade.",
+        f"- Data gap lebih dari 3 candle: {meta.get('data_gaps_over_3_candles', 'tidak tersedia')}.",
+        "- Hasil ini belum membuktikan robustness out-of-sample.",
+        "",
+        f"**Catatan eksekusi:** {meta.get('note', 'Tidak ada catatan tambahan.')}",
+    ]
+
+    report = "\n".join(lines) + "\n"
+    Path("eth_momentum_evaluation.md").write_text(report)
+    print(report)
+
+    github_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if github_summary:
+        with open(github_summary, "a") as f:
+            f.write(report)
+
+
+def main_legacy():
     path = sys.argv[1] if len(sys.argv) > 1 else CSV
     df = load(path)
     text = render(evaluate(df)) + ut_report(df) + mfe_report(df) + mtf_report(df) + regime_report() + excursion_report() + capital_report()
@@ -215,6 +372,14 @@ def main():
     if summary:
         with open(summary, "a") as f:
             f.write(text + "\n")
+
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--eth":
+        evaluate_eth()
+    else:
+        main_legacy()
 
 
 if __name__ == "__main__":
