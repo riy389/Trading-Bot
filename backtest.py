@@ -39,7 +39,8 @@ DAYS_BACK_TF = {"5m": 365 * 2, "15m": 365 * 2, "1h": 365 * 5, "4h": 365 * 5}   #
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
 ROUND_TRIP_FEE = TAKER_FEE * 2
 SLIPPAGE = 0.0005            # 0.05% per sisi
-COST_VERSIONS = {"net": ROUND_TRIP_FEE + 2 * SLIPPAGE, "gross": 0.0}   # % dari nilai posisi
+COST_VERSIONS = {"net": ROUND_TRIP_FEE + 2 * SLIPPAGE, "gross": 0.0}   # net = fallback global; biaya per pair: net_cost()
+SLIPPAGE_PAIR = {"BTC/USDT:USDT": 0.0002, "ETH/USDT:USDT": 0.0002}   # slippage per sisi; pair lain pakai SLIPPAGE   # % dari nilai posisi
 
 # UT Bot Alerts (default TradingView)
 UT_A = 1                     # Key Value (sensitivitas)
@@ -49,20 +50,24 @@ UT_HA = False                # sinyal dari close Heikin Ashi
 RISK_PER_TRADE = 0.01        # 1R = 1% ekuitas
 MIN_SL_PCT = 0.001           # jarak SL minimum (% harga) = batas leverage 10x (RISK_PER_TRADE / MIN_SL_PCT)
 
-SESSIONS = ["24h", "free"]
+SESSIONS = ["free"]
 TP_R = 1.5                   # TP tetap = TP_R x 1R dari entry (gross)
 # varian exit: nama -> (pakai trailing UT, pakai TP tetap)
 VARIANTS = {"trail": (True, False), "tp15": (False, True), "trail_tp15": (True, True),
             "trail_be1": (True, False), "trail_be05": (True, False),
             "trail_ema4h": (True, False),
+            "ema4h_bea1": (True, False), "ema4h_bea1_lock50": (True, False),
+            "ema4h_bea2_lock50": (True, False),
             "flip": (False, False)}   # flip: tanpa trailing/TP, keluar hanya di SL 1R atau sinyal balik (stop-and-reverse)
 # filter arah entry: long hanya kalau close sinyal > EMA200 4h, short hanya kalau <
-BIAS_VARIANTS = {"trail_ema4h"}
+BIAS_VARIANTS = {"trail_ema4h", "ema4h_bea1", "ema4h_bea1_lock50", "ema4h_bea2_lock50"}
 EMA_N = 200
-RUN_VARIANTS = ["trail", "trail_ema4h", "flip"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
-UT_GRID = [(2, 1), (1, 1), (3, 1), (2, 3), (2, 10)]   # (a, periode ATR); (2, 1) = setelan chart TradingView, sisanya tetangga
+RUN_VARIANTS = ["trail", "trail_ema4h", "flip", "ema4h_bea1", "ema4h_bea1_lock50", "ema4h_bea2_lock50"]   # varian yang dijalankan (VARIANTS lain dibiarkan, tidak jalan)
+UT_GRID = [(2, 10), (6, 10), (8, 10)]  # A 2/6/8, ATR 10   # (a, periode ATR); (2, 1) = setelan chart TradingView, sisanya tetangga
 # BEP: SL pindah ke entry +/- biaya setelah profit tertinggi (candle sebelumnya) >= trigger R
 BE_R = {"trail_be1": 1.0, "trail_be05": 0.5}
+# BEP/kunci dalam ATR (ATR(c) candle sinyal = jarak SL / A, adil antar Key): nama -> (BEP di +X ATR, (kunci mulai +Y ATR, sisa fraksi MFE)). Dikunci sebelum lihat hasil.
+ATR_RULES = {"ema4h_bea1": (1.0, None), "ema4h_bea1_lock50": (1.0, (3.0, 0.5)), "ema4h_bea2_lock50": (2.0, (4.0, 0.5))}
 BE_COST = COST_VERSIONS["net"]
 SESSION_LAST_ENTRY_MIN = 22 * 60   # 22:00 UTC = 05:00 WIB, entry terakhir
 SESSION_CLOSE_MIN = 23 * 60        # 23:00 UTC = 06:00 WIB, tutup paksa
@@ -74,6 +79,7 @@ CACHE_DIR = "cache"
 OUTPUT_JSON = "results.json"
 OUTPUT_CSV = "results_summary.csv"
 OUTPUT_CAP = "capital_sim.csv"
+OUTPUT_TRADES = "trades.csv"
 CHECK_UT = [(2, 1), (1, 10)]   # (a, periode ATR) untuk cek sinyal vs chart TradingView
 # simulasi modal kecil (versi net, periode full)
 CAP_START = 10.0             # modal awal (USDT) per pair
@@ -271,7 +277,8 @@ def apply_costs(trades, cost):
     return out
 
 
-def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None):
+def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None,
+                be_cost=BE_COST, lock=None):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -313,7 +320,12 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
             sl = pos["sl"]
             be_on = be_r is not None and pos["mfe"] >= be_r
             if be_on:
-                sl = pos["entry"] * (1 + sign * BE_COST)
+                sl = pos["entry"] * (1 + sign * be_cost)
+            lock_on = False
+            if lock is not None and pos["mfe"] >= lock[0]:
+                lk = pos["entry"] * (1 + sign * lock[1] * pos["mfe"] * pos["sl_pct"])
+                if sign * (lk - sl) > 0:
+                    sl, lock_on = lk, True
             trail = stop[i - 1]
             use_trail = trail_on and sign * (trail - sl) > 0
             lvl = trail if use_trail else sl
@@ -324,7 +336,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
             reason = None
             if fill is not None:
                 if not use_trail:
-                    reason = "be_stop" if be_on else "stop_loss"
+                    reason = "lock_stop" if lock_on else ("be_stop" if be_on else "stop_loss")
                 else:
                     reason = "trail_win" if sign * (fill - pos["entry"]) > 0 else "trail_loss"
             elif tp_on:
@@ -363,7 +375,7 @@ def htf_bias(df, df4):
 
 REASONS = {"stop_loss": "n_sl", "tp_fixed": "n_tp_fixed", "trail_win": "n_trail_win",
            "trail_loss": "n_trail_loss", "session_end": "n_session", "reverse": "n_reverse",
-           "be_stop": "n_be"}
+           "be_stop": "n_be", "lock_stop": "n_lock"}
 
 
 def _reason_counts(trades):
@@ -479,6 +491,72 @@ def capital_sim(trades, name, symbol, tf):
     return rows
 
 
+def net_cost(symbol):
+    # biaya net round-trip (% nilai posisi): fee taker 2 sisi + slippage per pair
+    return ROUND_TRIP_FEE + 2 * SLIPPAGE_PAIR.get(symbol, SLIPPAGE)
+
+
+BE_BASE = {"ema4h_bea1": "trail_ema4h", "ema4h_bea1_lock50": "trail_ema4h", "ema4h_bea2_lock50": "trail_ema4h"}
+
+
+def _pf_r(x):
+    pos, neg = x[x > 0].sum(), -x[x < 0].sum()
+    return round(float(pos / neg), 2) if neg > 0 else float("inf")
+
+
+def _emit(text):
+    print(text)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(text + "\n")
+
+
+def trade_reports(tr):
+    fence = "`" * 3
+    # 1) transisi: trade yang sama (symbol, tf, A, ATR, sesi, arah, entry_ts), dasar -> varian BEP/kunci
+    key = ["symbol", "timeframe", "ua", "uc", "session", "side", "entry_ts"]
+    rows = []
+    for var, base in BE_BASE.items():
+        b, e = tr[tr["variant"] == base], tr[tr["variant"] == var]
+        if b.empty or e.empty:
+            continue
+        j = b.merge(e, on=key, suffixes=("_b", "_e"))
+        if j.empty:
+            continue
+        j["d"] = j["net_R_e"] - j["net_R_b"]
+        j["w2be"] = (j["net_R_b"] > 0) & (j["exit_reason_e"] == "be_stop")
+        j["l2be"] = (j["net_R_b"] <= 0) & (j["exit_reason_e"] == "be_stop")
+        j["lk"] = j["exit_reason_e"] == "lock_stop"
+        for (tf, ua, uc), g in j.groupby(["timeframe", "ua", "uc"]):
+            rows.append({"var": var, "tf": tf, "A": ua, "ATR": uc, "n": len(g),
+                         "pf_base": _pf_r(g["net_R_b"]), "pf_var": _pf_r(g["net_R_e"]),
+                         "netR_base": g["net_R_b"].mean(), "netR_var": g["net_R_e"].mean(),
+                         "w2be_n": int(g["w2be"].sum()), "w2be_R": g.loc[g["w2be"], "d"].sum(),
+                         "l2be_n": int(g["l2be"].sum()), "l2be_R": g.loc[g["l2be"], "d"].sum(),
+                         "lock_n": int(g["lk"].sum()), "lock_R": g.loc[g["lk"], "d"].sum(),
+                         "dR_total": g["d"].sum()})
+    text = ""
+    if rows:
+        text += ("\n### Transisi BEP/kunci (net, semua pair, trade yang sama vs trail_ema4h). w2be = pemenang yang "
+                 "terpotong jadi impas, l2be = rugi yang terselamatkan, lock = exit kena kunci; *_R = jumlah selisih net_R vs dasar\n"
+                 + fence + "\n" + pd.DataFrame(rows).round(3).to_string(index=False) + "\n" + fence)
+    # 2) lama tahan posisi + netR per kelompok lama tahan
+    h = tr.copy()
+    h["h"] = (pd.to_datetime(h["exit_ts"]) - pd.to_datetime(h["entry_ts"])).dt.total_seconds() / 3600
+    hrows = []
+    for (v, tf, ua, uc), g in h.groupby(["variant", "timeframe", "ua", "uc"]):
+        row = {"var": v, "tf": tf, "A": ua, "ATR": uc, "n": len(g),
+               "med_h": g["h"].median(), "p90_h": g["h"].quantile(0.9)}
+        for nm, m in (("le1d", g["h"] <= 24), ("1-3d", (g["h"] > 24) & (g["h"] <= 72)), ("gt3d", g["h"] > 72)):
+            row["n_" + nm] = int(m.sum())
+            row["R_" + nm] = g.loc[m, "net_R"].mean() if m.any() else float("nan")
+        hrows.append(row)
+    text += ("\n### Lama tahan posisi (jam) dan netR per kelompok (net, semua pair). le1d = tahan <= 24 jam\n"
+             + fence + "\n" + pd.DataFrame(hrows).round(3).to_string(index=False) + "\n" + fence)
+    _emit(text)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -492,7 +570,7 @@ def main():
     check_signals(exchange)
     if os.environ.get("CHECK_ONLY") == "1":
         return
-    all_results, cap_rows = [], []
+    all_results, cap_rows, trade_rows = [], [], []
     for symbol in PAIRS:
         df4 = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK_TF["4h"])   # acuan bias EMA200 4h
         if df4 is None or len(df4) <= EMA_N or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df4, "4h")):
@@ -521,15 +599,24 @@ def main():
                                 continue
                             if vname in BIAS_VARIANTS and bias is None:
                                 continue
-                            trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on, BE_R.get(vname),
-                                                 bias if vname in BIAS_VARIANTS else None)
+                            be_atr, lk = ATR_RULES.get(vname, (None, None))
+                            trades = simulate_ut(df, ut, session, allow_short, trail_on, tp_on,
+                                                 BE_R.get(vname) if be_atr is None else be_atr / ua,
+                                                 bias if vname in BIAS_VARIANTS else None,
+                                                 be_cost=net_cost(symbol),
+                                                 lock=None if lk is None else (lk[0] / ua, lk[1]))
                             tp_label = "+".join(x for x in ("trail_UT" if trail_on else "", f"TP{TP_R:g}R" if tp_on else "", f"BE{BE_R[vname]:g}R" if vname in BE_R else "") if x) or "flip_UT"
-                            for cost_name, cost in COST_VERSIONS.items():
+                            for cost_name in COST_VERSIONS:
+                                cost = net_cost(symbol) if cost_name == "net" else 0.0
                                 suffix = "" if cost_name == "net" else "_gross"
                                 name = f"UT_a{ua:g}_c{uc}_{session}_{vname}{suffix}"
                                 costed = apply_costs(trades, cost)
                                 if cost_name == "net":
                                     cap_rows += capital_sim(costed, name, symbol, tf)
+                                    trade_rows += [{"symbol": symbol, "timeframe": tf, "ua": ua, "uc": uc, "session": session,
+                                                    "variant": vname, "side": t["side"], "entry_ts": t["entry_ts"], "exit_ts": t["exit_ts"],
+                                                    "exit_reason": t["exit_reason"], "gross_R": t["gross_R"], "net_R": t["net_R"]}
+                                                   for t in costed]
                                 for period, tr in split_by_period(costed, split_ts).items():
                                     all_results.append(compute_metrics(
                                         tr, name, symbol, tf, "SL1R_fixed", tp_label, period, mode))
@@ -544,6 +631,10 @@ def main():
     df_summary.to_csv(OUTPUT_CSV, index=False)
     if cap_rows:
         pd.DataFrame(cap_rows).to_csv(OUTPUT_CAP, index=False)
+    if trade_rows:
+        tr_df = pd.DataFrame(trade_rows)
+        tr_df.to_csv(OUTPUT_TRADES, index=False)
+        trade_reports(tr_df)
     print("\n" + "=" * 100)
     print(df_summary.to_string(index=False))
     print(f"\nDisimpan ke: {OUTPUT_CSV} dan {OUTPUT_JSON}")
