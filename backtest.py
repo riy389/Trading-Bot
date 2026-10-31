@@ -557,6 +557,135 @@ def trade_reports(tr):
     _emit(text)
 
 
+# ---------- Tes SL = TP tetap 1% harga (BTC); candle yang kena SL dan TP sekaligus dicek di 1m ----------
+FIXED_RR = True              # True: main() hanya menjalankan tes ini lalu selesai (False = backtest lama)
+FRR_PCT = 0.01               # SL = TP = 1% harga dari entry (= 1R)
+FRR_COSTS = {"009": 0.0009, "022": 0.0022}   # biaya round-trip (% nilai posisi), dipotong di luar strategi
+FRR_SYMBOL = "BTC/USDT:USDT"
+FRR_TFS = ["15m", "1h"]
+FRR_GRID = [(2, 10), (6, 10)]   # (A, ATR period)
+
+
+def frr_resolver(exchange, symbol, tf, df, cache, stats):
+    """Candle kena SL dan TP sekaligus -> lihat candle 1m di dalamnya. 1m pertama yang menyentuh salah satu
+    level menentukan; kalau 1m itu menyentuh keduanya -> TP duluan. Data 1m tidak ada -> dianggap SL (dihitung unres)."""
+    mins = int(pd.Timedelta(tf) / pd.Timedelta(minutes=1))
+    def resolve(i, sign, sl, tp):
+        stats["conf"] += 1
+        t0 = int(df["ts"].iloc[i].timestamp() * 1000)
+        if (tf, t0) not in cache:
+            try:
+                c = exchange.fetch_ohlcv(symbol, "1m", since=t0, limit=mins)
+            except Exception as e:
+                print(f"  [!] 1m gagal {t0}: {e}")
+                c = []
+            cache[(tf, t0)] = [x for x in c if t0 <= x[0] < t0 + mins * 60000]
+            time.sleep(exchange.rateLimit / 1000)
+        for _, _, h1, l1, _, _ in cache[(tf, t0)]:
+            hs = l1 <= sl if sign == 1 else h1 >= sl
+            ht = h1 >= tp if sign == 1 else l1 <= tp
+            if hs and ht:
+                stats["tie1m"] += 1
+                return True
+            if ht:
+                return True
+            if hs:
+                return False
+        stats["unres"] += 1
+        return False
+    return resolve
+
+
+def frr_sim(df, buy, sell, bias, resolve):
+    """Sinyal di close candle i-1, entry di open candle i, SL = TP = FRR_PCT dari entry. Sinyal saat posisi
+    masih hidup diabaikan. Exit dicek mulai candle entry; gap -> fill di open."""
+    o, h, l = (df[k].to_numpy(dtype=float) for k in ("open", "high", "low"))
+    tss = df["ts"].tolist()
+    P = FRR_PCT
+    trades, pos, pending = [], None, None
+    for i in range(1, len(df)):
+        if pending is not None:
+            sign = 1 if pending == "long" else -1
+            if pos is None and (bias is None or bias[i - 1] == sign):
+                e = o[i]
+                pos = {"sign": sign, "e": e, "ts": tss[i], "sl": e * (1 - sign * P), "tp": e * (1 + sign * P)}
+            pending = None
+        if pos is not None:
+            sign, sl, tp = pos["sign"], pos["sl"], pos["tp"]
+            hit_sl = l[i] <= sl if sign == 1 else h[i] >= sl
+            hit_tp = h[i] >= tp if sign == 1 else l[i] <= tp
+            win = None
+            if hit_sl and hit_tp:
+                win = resolve(i, sign, sl, tp)
+            elif hit_tp:
+                win = True
+            elif hit_sl:
+                win = False
+            if win is not None:
+                lvl = tp if win else sl
+                fill = max(o[i], lvl) if (sign == 1) == win else min(o[i], lvl)
+                trades.append({"entry_ts": str(pos["ts"]), "gross_R": sign * (fill - pos["e"]) / pos["e"] / P})
+                pos = None
+        if buy[i]:
+            pending = "long"
+        elif sell[i]:
+            pending = "short"
+    return trades
+
+
+def frr_row(tag, tf, a, trades, stats, split_ts):
+    g = np.array([t["gross_R"] for t in trades])
+    row = {"filter": tag, "tf": tf, "A": a, "n": len(g)}
+    if not len(g):
+        return row
+    isg = np.array([t["gross_R"] for t in trades if t["entry_ts"] < str(split_ts)])
+    oog = np.array([t["gross_R"] for t in trades if t["entry_ts"] >= str(split_ts)])
+    row.update({"wr_gross": round(float((g > 0).mean() * 100), 1), "gross_R": round(float(g.mean()), 3)})
+    for nm, c in FRR_COSTS.items():
+        net = g - c / FRR_PCT
+        row["netR_" + nm] = round(float(net.mean()), 3)
+        row["pf_" + nm] = _pf_r(pd.Series(net))
+        row["be_wr_" + nm] = round((1 + c / FRR_PCT) / 2 * 100, 1)
+    row.update({"gR_IS": round(float(isg.mean()), 3) if len(isg) else None, "n_IS": len(isg),
+                "gR_OOS": round(float(oog.mean()), 3) if len(oog) else None, "n_OOS": len(oog),
+                "conf": stats["conf"], "tie1m": stats["tie1m"], "unres": stats["unres"]})
+    return row
+
+
+def run_fixed_rr(exchange):
+    df4 = fetch_ohlcv_cached(exchange, FRR_SYMBOL, "4h", DAYS_BACK_TF["4h"])
+    rows, cache = [], {}
+    for tf in FRR_TFS:
+        df = fetch_ohlcv_cached(exchange, FRR_SYMBOL, tf, DAYS_BACK_TF[tf])
+        if df is None or len(df) < 100:
+            print(f"  [!] Data {tf} tidak cukup, skip.")
+            continue
+        split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+        bias = htf_bias(df, df4) if df4 is not None and len(df4) > EMA_N else None
+        nsig = 0
+        for a, c in FRR_GRID:
+            _, buy, sell, _ = ut_bot(df, a, c)
+            if a == FRR_GRID[0][0]:
+                nsig = int(buy.sum() + sell.sum())
+            for tag, b in (("none", None), ("ema4h", bias)):
+                if tag == "ema4h" and bias is None:
+                    continue
+                stats = {"conf": 0, "tie1m": 0, "unres": 0}
+                tr = frr_sim(df, buy, sell, b, frr_resolver(exchange, FRR_SYMBOL, tf, df, cache, stats))
+                rows.append(frr_row(tag, tf, a, tr, stats, split_ts))
+        # pembanding: sinyal acak (arah acak, jumlah sinyal sama dengan UT A pertama), exit sama
+        rng = np.random.default_rng(1)
+        hit = rng.random(len(df)) < nsig / len(df)
+        side = rng.random(len(df)) < 0.5
+        stats = {"conf": 0, "tie1m": 0, "unres": 0}
+        tr = frr_sim(df, hit & side, hit & ~side, None, frr_resolver(exchange, FRR_SYMBOL, tf, df, cache, stats))
+        rows.append(frr_row("random", tf, 0, tr, stats, split_ts))
+    fence = "`" * 3
+    _emit("\n### SL = TP = 1% harga tetap, BTC. wr/gross_R = tanpa biaya; netR_009 / netR_022 = biaya 0,09% / 0,22%; "
+          "be_wr = win rate impas; conf = candle kena SL dan TP sekaligus, tie1m = 1m yang juga kena keduanya (-> TP), "
+          "unres = data 1m tidak ada (-> SL)\n" + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -569,6 +698,9 @@ def main():
     exchange.load_markets()
     check_signals(exchange)
     if os.environ.get("CHECK_ONLY") == "1":
+        return
+    if FIXED_RR:
+        run_fixed_rr(exchange)
         return
     all_results, cap_rows, trade_rows = [], [], []
     for symbol in PAIRS:
