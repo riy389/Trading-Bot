@@ -225,7 +225,7 @@ def build_signals(df):
 
     daily_ok = daily_regime(df)
 
-    signal = (
+    long_signal = (
         recent_squeeze
         & momentum_up
         & volume_ok
@@ -236,11 +236,30 @@ def build_signals(df):
         & daily_ok
     )
 
-    return atr_values.to_numpy(), signal.fillna(False).to_numpy(), regime
+    breakdown = close < bb_lower - atr_values * BREAKOUT_ATR
+    momentum_down = (momentum < 0) & (momentum < momentum.shift(1))
+
+    short_signal = (
+        recent_squeeze
+        & momentum_down
+        & volume_ok
+        & breakdown
+        & (body_pct >= MIN_BODY_PCT)
+        & (rsi_values > 100 - RSI_LONG_MAX)
+        & atr_pct_ok
+        & daily_ok
+    )
+
+    return (
+        atr_values.to_numpy(),
+        long_signal.fillna(False).to_numpy(),
+        short_signal.fillna(False).to_numpy(),
+        regime
+    )
 
 
 def run_backtest(df):
-    atr_values, signals, regimes = build_signals(df)
+    atr_values, signals, _, regimes = build_signals(df)
 
     opens = df["open"].to_numpy(float)
     highs = df["high"].to_numpy(float)
@@ -384,6 +403,183 @@ def run_backtest(df):
     return trades
 
 
+
+def run_backtest_directional(df, variant):
+    """Run long/short experiment without changing the LONG_ONLY baseline."""
+    atr_values, long_signals, short_signals, regimes = build_signals(df)
+
+    opens = df["open"].to_numpy(float)
+    highs = df["high"].to_numpy(float)
+    lows = df["low"].to_numpy(float)
+    closes = df["close"].to_numpy(float)
+    timestamps = df["ts"].astype(str).to_numpy()
+
+    trades = []
+    position = None
+    pending_entry = None
+    bars_since_exit = 999
+
+    for i in range(1, len(df)):
+        closed_this_bar = False
+
+        if pending_entry is not None and position is None and np.isfinite(atr_values[i - 1]):
+            direction = pending_entry
+            scale = (
+                HOT_SCALE if regimes[i - 1] == 1
+                else COLD_SCALE if regimes[i - 1] == -1
+                else 1.0
+            )
+            entry_reference = closes[i - 1]
+            entry_atr = atr_values[i - 1]
+
+            position = {
+                "variant": variant,
+                "side": "LONG" if direction == 1 else "SHORT",
+                "direction": direction,
+                "signal_ts": timestamps[i - 1],
+                "entry_ts": timestamps[i],
+                "entry": opens[i],
+                "entry_reference": entry_reference,
+                "entry_atr": entry_atr,
+                "sl": entry_reference - direction * entry_atr * SL_MULT * scale,
+                "tp": entry_reference + direction * entry_atr * TP2_MULT * scale,
+                "trail_mult": TRAIL_MULT * scale,
+                "scale": scale,
+                "stagn_bars": (
+                    STAGN_HOT if regimes[i - 1] == 1
+                    else STAGN_COLD if regimes[i - 1] == -1
+                    else STAGN_NORMAL
+                ),
+                "bars": 0,
+                "mfe_close": 0.0,
+                "be": False,
+                "regime": int(regimes[i - 1])
+            }
+            pending_entry = None
+
+        if position is not None:
+            direction = position["direction"]
+            stop = position["sl"]
+            exit_price = None
+            exit_reason = None
+
+            if direction == 1:
+                if lows[i] <= stop:
+                    exit_price = min(opens[i], stop)
+                    exit_reason = "stop_loss"
+                elif highs[i] >= position["tp"]:
+                    exit_price = max(opens[i], position["tp"])
+                    exit_reason = "take_profit"
+            else:
+                if highs[i] >= stop:
+                    exit_price = max(opens[i], stop)
+                    exit_reason = "stop_loss"
+                elif lows[i] <= position["tp"]:
+                    exit_price = min(opens[i], position["tp"])
+                    exit_reason = "take_profit"
+
+            if exit_reason:
+                pnl = direction * (exit_price / position["entry"] - 1)
+                trades.append({
+                    **position,
+                    "exit_ts": timestamps[i],
+                    "exit_price": exit_price,
+                    "exit_reason": exit_reason,
+                    "return_pct": pnl * 100
+                })
+                position = None
+                bars_since_exit = 0
+                closed_this_bar = True
+            else:
+                position["bars"] += 1
+                favorable_move = direction * (closes[i] - position["entry"])
+                position["mfe_close"] = max(
+                    position["mfe_close"], favorable_move
+                )
+
+                if (
+                    not position["be"]
+                    and favorable_move >= position["entry_atr"] * BE_TRIGGER
+                ):
+                    position["be"] = True
+                    be_stop = (
+                        position["entry"] + direction
+                        * position["entry_atr"] * BE_OFFSET
+                    )
+                    position["sl"] = (
+                        max(position["sl"], be_stop)
+                        if direction == 1
+                        else min(position["sl"], be_stop)
+                    )
+
+                if np.isfinite(atr_values[i]):
+                    trail_stop = (
+                        closes[i] - direction
+                        * atr_values[i] * position["trail_mult"]
+                    )
+                    position["sl"] = (
+                        max(position["sl"], trail_stop)
+                        if direction == 1
+                        else min(position["sl"], trail_stop)
+                    )
+
+                if position["bars"] >= MAX_BARS:
+                    pending_exit = "timeout"
+                elif (
+                    position["bars"] >= position["stagn_bars"]
+                    and position["mfe_close"]
+                    < position["entry_atr"] * STAGN_ATR
+                ):
+                    pending_exit = "stagnation"
+                else:
+                    pending_exit = None
+
+                if pending_exit and i + 1 < len(df):
+                    next_open = opens[i + 1]
+                    trades.append({
+                        **position,
+                        "exit_ts": timestamps[i + 1],
+                        "exit_price": next_open,
+                        "exit_reason": pending_exit,
+                        "return_pct": (
+                            direction * (next_open / position["entry"] - 1)
+                        ) * 100
+                    })
+                    position = None
+                    bars_since_exit = 0
+                    closed_this_bar = True
+
+        if position is None:
+            if not closed_this_bar:
+                bars_since_exit += 1
+
+            if bars_since_exit >= COOLDOWN:
+                if variant == "B_LONG_SHORT":
+                    if long_signals[i]:
+                        pending_entry = 1
+                    elif short_signals[i]:
+                        pending_entry = -1
+                elif variant == "C_HOT_LONG_COLD_SHORT":
+                    if long_signals[i] and regimes[i] == 1:
+                        pending_entry = 1
+                    elif short_signals[i] and regimes[i] == -1:
+                        pending_entry = -1
+
+    if position is not None:
+        direction = position["direction"]
+        trades.append({
+            **position,
+            "exit_ts": timestamps[-1],
+            "exit_price": closes[-1],
+            "exit_reason": "end_data",
+            "return_pct": (
+                direction * (closes[-1] / position["entry"] - 1)
+            ) * 100
+        })
+
+    return trades
+
+
 def main():
     print(f"Fetching {SYMBOL} native {TIMEFRAME} candles from Bitget...")
 
@@ -429,55 +625,41 @@ def main():
             "ERROR: data gaps exceed tolerance; refusing to publish result."
         )
 
-    trades = run_backtest(df)
-    trade_df = pd.DataFrame(trades)
+    baseline = pd.DataFrame(run_backtest(df))
+    if not baseline.empty:
+        baseline["variant"] = "A_LONG_ONLY"
+        baseline["side"] = "LONG"
+
+    variant_b = pd.DataFrame(
+        run_backtest_directional(df, "B_LONG_SHORT")
+    )
+    variant_c = pd.DataFrame(
+        run_backtest_directional(df, "C_HOT_LONG_COLD_SHORT")
+    )
+
+    trade_df = pd.concat(
+        [baseline, variant_b, variant_c],
+        ignore_index=True
+    )
     trade_df.to_csv("eth_momentum_trades.csv", index=False)
 
-    if len(trade_df):
-        wins = trade_df[trade_df.return_pct > 0]
-        losses = trade_df[trade_df.return_pct <= 0]
-
-        gross_profit = wins.return_pct.sum()
-        gross_loss = abs(losses.return_pct.sum())
-
-        equity = (1 + trade_df.return_pct / 100).cumprod()
-        drawdown = equity / equity.cummax() - 1
-
-        summary = {
-            "symbol": SYMBOL,
-            "timeframe": TIMEFRAME,
-            "period_start": str(df.ts.iloc[0]),
-            "period_end": str(df.ts.iloc[-1]),
-            "candles": int(len(df)),
-            "trades": int(len(trade_df)),
-            "win_rate_pct": round(
-                len(wins) / len(trade_df) * 100, 2
-            ),
-            "profit_factor": (
-                round(gross_profit / gross_loss, 4)
-                if gross_loss else None
-            ),
-            "total_return_pct_compounded": round(
-                (equity.iloc[-1] - 1) * 100, 2
-            ),
-            "max_drawdown_pct_trade_equity": round(
-                drawdown.min() * 100, 2
-            ),
-            "exit_reasons": trade_df.exit_reason.value_counts().to_dict(),
-            "data_gaps_over_3_candles": len(gaps),
-            "note": (
-                "OHLC approximation, not tick replay. "
-                "Intrabar SL is prioritized over TP."
-            )
-        }
-    else:
-        summary = {
-            "symbol": SYMBOL,
-            "timeframe": TIMEFRAME,
-            "trades": 0,
-            "period_start": str(df.ts.iloc[0]),
-            "period_end": str(df.ts.iloc[-1])
-        }
+    summary = {
+        "symbol": SYMBOL,
+        "timeframe": TIMEFRAME,
+        "period_start": str(df.ts.iloc[0]),
+        "period_end": str(df.ts.iloc[-1]),
+        "candles": int(len(df)),
+        "trades": int(len(trade_df)),
+        "trades_by_variant": (
+            trade_df.groupby("variant").size().to_dict()
+            if not trade_df.empty else {}
+        ),
+        "data_gaps_over_3_candles": len(gaps),
+        "note": (
+            "OHLC approximation, not tick replay. "
+            "Intrabar SL is prioritized over TP."
+        )
+    }
 
     Path("eth_momentum_summary.json").write_text(
         json.dumps(summary, indent=2)

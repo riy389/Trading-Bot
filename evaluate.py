@@ -210,145 +210,165 @@ def capital_report(path="capital_sim.csv"):
 
 def evaluate_eth(summary_path="eth_momentum_summary.json",
                  trades_path="eth_momentum_trades.csv"):
-    """Evaluate ETH Momentum Breakout and publish a GitHub Actions summary."""
+    """Compare the three ETH Momentum Breakout variants."""
     with open(summary_path) as f:
         meta = json.load(f)
 
     df = pd.read_csv(trades_path)
     if not df.empty:
-        df = df.sort_values("entry_ts").reset_index(drop=True)
+        df = df.sort_values(["variant", "entry_ts"]).reset_index(drop=True)
         df["return_pct"] = pd.to_numeric(df["return_pct"], errors="coerce")
         df = df.dropna(subset=["return_pct"])
-
-    n = len(df)
-    wins = df[df["return_pct"] > 0]["return_pct"] if n else pd.Series(dtype=float)
-    losses = df[df["return_pct"] <= 0]["return_pct"] if n else pd.Series(dtype=float)
-
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
-    pf = gross_profit / gross_loss if gross_loss else float("inf")
-    wr = len(wins) / n * 100 if n else 0
-    total_return = ((1 + df["return_pct"] / 100).prod() - 1) * 100 if n else 0
-
-    if n:
-        equity = (1 + df["return_pct"] / 100).cumprod()
-        max_dd = ((equity / equity.cummax()) - 1).min() * 100
-    else:
-        max_dd = 0
-
-    avg_win = wins.mean() if len(wins) else 0
-    avg_loss = losses.mean() if len(losses) else 0
-    payoff = avg_win / abs(avg_loss) if avg_loss else float("inf")
 
     def fmt(value, digits=2):
         if value == float("inf"):
             return "∞"
         return f"{value:.{digits}f}"
 
+    def metrics(group):
+        returns = group["return_pct"]
+        wins = returns[returns > 0]
+        losses = returns[returns <= 0]
+        gross_loss = abs(losses.sum())
+        pf = wins.sum() / gross_loss if gross_loss else float("inf")
+        equity = (1 + returns / 100).cumprod()
+        dd = ((equity / equity.cummax()) - 1).min() * 100 if len(group) else 0
+        total = (equity.iloc[-1] - 1) * 100 if len(group) else 0
+        avg_win = wins.mean() if len(wins) else 0
+        avg_loss = losses.mean() if len(losses) else 0
+        payoff = avg_win / abs(avg_loss) if avg_loss else float("inf")
+        wr = len(wins) / len(group) * 100 if len(group) else 0
+        return {
+            "trades": len(group), "wr": wr, "pf": pf,
+            "return": total, "dd": dd, "avg_win": avg_win,
+            "avg_loss": avg_loss, "payoff": payoff
+        }
+
+    labels = {
+        "A_LONG_ONLY": "A — LONG ONLY (baseline)",
+        "B_LONG_SHORT": "B — LONG + SHORT",
+        "C_HOT_LONG_COLD_SHORT": "C — HOT LONG / COLD SHORT"
+    }
+
+    variants = [
+        name for name in (
+            "A_LONG_ONLY",
+            "B_LONG_SHORT",
+            "C_HOT_LONG_COLD_SHORT"
+        )
+        if not df.empty and (df["variant"] == name).any()
+    ]
+    stats = {
+        name: metrics(df[df["variant"] == name].copy())
+        for name in variants
+    }
+
     lines = [
-        "# ETH Momentum Breakout — Evaluasi Backtest",
+        "# ETH Momentum Breakout — Perbandingan Varian",
         "",
         f"**Pair:** {meta.get('symbol', 'ETH/USDT:USDT')}  ",
         f"**Timeframe:** {meta.get('timeframe', '2h')}  ",
         f"**Data candle:** {meta.get('period_start', '?')} → {meta.get('period_end', '?')}  ",
         f"**Jumlah candle:** {meta.get('candles', '?')}  ",
         "",
-        "## Ringkasan performa",
+        "## Perbandingan performa",
         "",
-        "| Metrik | Hasil |",
-        "|---|---:|",
-        f"| Total trade | {n} |",
-        f"| Win rate | {fmt(wr)}% |",
-        f"| Profit factor | {fmt(pf)} |",
-        f"| Compounded return | {fmt(total_return)}% |",
-        f"| Max drawdown (equity per trade) | {fmt(max_dd)}% |",
-        f"| Average win | {fmt(avg_win)}% |",
-        f"| Average loss | {fmt(avg_loss)}% |",
-        f"| Average win/loss ratio | {fmt(payoff)} |",
-        "",
-        "## Exit reason",
-        "",
-        "| Exit | Jumlah |",
-        "|---|---:|",
+        "| Varian | Trade | Win rate | PF | Return compounded | Max DD | Avg win/loss |",
+        "|---|---:|---:|---:|---:|---:|---:|",
     ]
 
-    if n:
-        for name, count in df["exit_reason"].value_counts().items():
-            lines.append(f"| {name} | {count} |")
+    for name in variants:
+        m = stats[name]
+        lines.append(
+            f"| {labels[name]} | {m['trades']} | {fmt(m['wr'])}% | "
+            f"{fmt(m['pf'])} | {fmt(m['return'])}% | "
+            f"{fmt(m['dd'])}% | {fmt(m['payoff'])} |"
+        )
+
+    lines += ["", "## Exit reason", "", "| Varian | Exit | Jumlah |", "|---|---|---:|"]
+    if not df.empty:
+        for (variant, reason), count in df.groupby(
+            ["variant", "exit_reason"]
+        ).size().items():
+            lines.append(
+                f"| {labels.get(variant, variant)} | {reason} | {count} |"
+            )
     else:
-        lines.append("| Tidak ada trade | 0 |")
+        lines.append("| - | Tidak ada trade | 0 |")
 
     lines += [
         "",
         "## Hasil per tahun",
         "",
-        "| Tahun | Trade | Win rate | PF | Return compounded |",
-        "|---:|---:|---:|---:|---:|",
+        "| Varian | Tahun | Trade | Win rate | PF | Return compounded |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
 
-    if n:
+    if not df.empty:
         df["year"] = pd.to_datetime(df["entry_ts"], utc=True).dt.year
-        for year, group in df.groupby("year"):
-            w = group[group["return_pct"] > 0]["return_pct"]
-            l = group[group["return_pct"] <= 0]["return_pct"]
-            gp, gl = w.sum(), abs(l.sum())
-            year_pf = gp / gl if gl else float("inf")
-            year_return = ((1 + group["return_pct"] / 100).prod() - 1) * 100
-            year_wr = len(w) / len(group) * 100
+        for (variant, year), group in df.groupby(["variant", "year"]):
+            m = metrics(group)
             lines.append(
-                f"| {year} | {len(group)} | {fmt(year_wr)}% | "
-                f"{fmt(year_pf)} | {fmt(year_return)}% |"
+                f"| {labels.get(variant, variant)} | {year} | "
+                f"{m['trades']} | {fmt(m['wr'])}% | {fmt(m['pf'])} | "
+                f"{fmt(m['return'])}% |"
             )
     else:
-        lines.append("| - | 0 | - | - | - |")
+        lines.append("| - | - | 0 | - | - | - |")
 
     lines += [
         "",
         "## Hasil berdasarkan regime",
         "",
-        "| Regime | Trade | Win rate | PF | Avg return/trade |",
-        "|---:|---:|---:|---:|---:|",
+        "| Varian | Regime | Trade | Win rate | PF | Avg return/trade |",
+        "|---|---|---:|---:|---:|---:|",
     ]
 
-    if n and "regime" in df.columns:
-        for regime, group in df.groupby("regime"):
-            w = group[group["return_pct"] > 0]["return_pct"]
-            l = group[group["return_pct"] <= 0]["return_pct"]
-            gp, gl = w.sum(), abs(l.sum())
-            regime_pf = gp / gl if gl else float("inf")
-            regime_wr = len(w) / len(group) * 100
-            avg_ret = group["return_pct"].mean()
+    if not df.empty and "regime" in df.columns:
+        for (variant, regime), group in df.groupby(["variant", "regime"]):
+            m = metrics(group)
             label = {1: "HOT", 0: "NORMAL", -1: "COLD"}.get(
                 int(regime), str(regime)
             )
             lines.append(
-                f"| {label} | {len(group)} | {fmt(regime_wr)}% | "
-                f"{fmt(regime_pf)} | {fmt(avg_ret)}% |"
+                f"| {labels.get(variant, variant)} | {label} | "
+                f"{m['trades']} | {fmt(m['wr'])}% | {fmt(m['pf'])} | "
+                f"{fmt(group['return_pct'].mean())}% |"
             )
     else:
-        lines.append("| - | 0 | - | - | - |")
+        lines.append("| - | - | 0 | - | - | - |")
 
     lines += [
         "",
-        "## Pembanding README",
+        "## Pembanding README — baseline A",
         "",
-        "| Metrik | README | Hasil backtest ini |",
+        "| Metrik | README | A — LONG ONLY |",
         "|---|---:|---:|",
-        f"| Return | +197% | {fmt(total_return)}% |",
-        f"| Profit factor | 3.08 | {fmt(pf)} |",
-        f"| Win rate | 56% | {fmt(wr)}% |",
-        f"| Max drawdown | sekitar 14% | {fmt(abs(max_dd))}% |",
-        "",
-        "> Angka README adalah angka referensi, bukan kriteria kelulusan otomatis. "
-        "Perbandingan harus memperhatikan kesamaan data, periode, dan asumsi eksekusi.",
+    ]
+
+    if "A_LONG_ONLY" in stats:
+        base = stats["A_LONG_ONLY"]
+        lines += [
+            f"| Return | +197% | {fmt(base['return'])}% |",
+            f"| Profit factor | 3.08 | {fmt(base['pf'])} |",
+            f"| Win rate | 56% | {fmt(base['wr'])}% |",
+            f"| Max drawdown | sekitar 14% | {fmt(abs(base['dd']))}% |",
+        ]
+    else:
+        lines.append("| - | - | Baseline tidak menghasilkan trade |")
+
+    lines += [
         "",
         "## Catatan validitas",
         "",
-        "- Backtest ini menggunakan pendekatan OHLC, bukan tick replay.",
-        "- Belum ada pemisahan IS/OOS pada laporan ini.",
-        "- Max drawdown dihitung dari equity berurutan per trade.",
+        "- Varian A mempertahankan baseline Long Only sebagai pembanding.",
+        "- Varian B mengaktifkan sinyal Long dan Short pada semua regime.",
+        "- Varian C hanya Long pada HOT dan Short pada COLD; NORMAL tidak entry.",
+        "- Short memakai aturan SL, TP, break-even, dan trailing yang dicerminkan.",
+        "- Backtest menggunakan pendekatan OHLC, bukan tick replay.",
+        "- Belum ada pemisahan IS/OOS.",
+        "- Max drawdown dihitung dari equity berurutan per trade untuk setiap varian.",
         f"- Data gap lebih dari 3 candle: {meta.get('data_gaps_over_3_candles', 'tidak tersedia')}.",
-        "- Hasil ini belum membuktikan robustness out-of-sample.",
         "",
         f"**Catatan eksekusi:** {meta.get('note', 'Tidak ada catatan tambahan.')}",
     ]
