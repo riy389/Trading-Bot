@@ -37,7 +37,7 @@ ATR_LEN = 14
 SL_MULT, TP2_MULT, TRAIL_MULT = 2.0, 3.5, 2.5
 BE_TRIGGER, BE_OFFSET = 1.2, 0.2
 COOLDOWN, MAX_BARS = 12, 100
-STAGN_BARS, STAGN_ATR = 10, 0.5
+STAGN_HOT, STAGN_NORMAL, STAGN_COLD, STAGN_ATR = 15, 10, 7, 0.5
 EMA_DIST_MAX = 35.0
 DAILY_VOL_MIN, DAILY_VOL_MAX = 0.3, 1.5
 ADAPT_VOL_LEN, ADAPT_EMA_LEN = 100, 50
@@ -104,7 +104,7 @@ def daily_regime(df):
     ]
 
     daily = daily_source.resample(
-        "1D", label="right", closed="right"
+        "1D", label="left", closed="left"
     ).agg({
         "open": "first",
         "high": "max",
@@ -122,7 +122,7 @@ def daily_regime(df):
     ).mean()
 
     daily_features = pd.DataFrame({
-        "available_at": daily.index,
+        "available_at": daily.index + pd.Timedelta(days=1),
         "daily_ema200": daily_ema.to_numpy(),
         "daily_vol_ratio": daily_vol_ratio.to_numpy()
     }).dropna(subset=["available_at"])
@@ -184,6 +184,7 @@ def build_signals(df):
             if bars_since == 0:
                 last_valid = previous_duration >= SQZ_MIN_BARS
             bars_since += 1
+            duration = 0
 
         recent_squeeze[i] = (
             0 < bars_since <= SQZ_MAX_BARS and last_valid
@@ -275,6 +276,11 @@ def run_backtest(df):
                 "tp": entry_reference + entry_atr * TP2_MULT * scale,
                 "trail_mult": TRAIL_MULT * scale,
                 "scale": scale,
+                "stagn_bars": (
+                    STAGN_HOT if regimes[i - 1] == 1
+                    else STAGN_COLD if regimes[i - 1] == -1
+                    else STAGN_NORMAL
+                ),
                 "bars": 0,
                 "mfe_close": 0.0,
                 "be": False,
@@ -334,7 +340,7 @@ def run_backtest(df):
                 if position["bars"] >= MAX_BARS:
                     pending_exit = "timeout"
                 elif (
-                    position["bars"] >= STAGN_BARS
+                    position["bars"] >= position["stagn_bars"]
                     and position["mfe_close"]
                     < position["entry_atr"] * STAGN_ATR
                 ):
