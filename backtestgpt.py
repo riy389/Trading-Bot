@@ -23,8 +23,11 @@ from backtest import fetch_ohlcv_cached, find_ohlcv_gaps
 SYMBOL = "ETH/USDT:USDT"
 TIMEFRAME = "2h"
 DAYS_BACK = 2300
-START = pd.Timestamp("2020-10-01 00:00:00", tz="UTC")
-END = pd.Timestamp("2026-03-01 00:00:00", tz="UTC")
+# Warm-up data + October 2026 entry test
+START = pd.Timestamp("2025-01-01 00:00:00", tz="UTC")
+END = pd.Timestamp("2026-11-02 00:00:00", tz="UTC")
+ENTRY_START = pd.Timestamp("2026-10-01 00:00:00", tz="UTC")
+ENTRY_END = pd.Timestamp("2026-11-01 00:00:00", tz="UTC")
 
 BB_LEN, BB_MULT = 20, 2.0
 KC_LEN, KC_MULT = 20, 1.5
@@ -386,7 +389,11 @@ def run_backtest(df):
             if not closed_this_bar:
                 bars_since_exit += 1
 
-            if signals[i] and bars_since_exit >= COOLDOWN:
+            if (
+                signals[i]
+                and bars_since_exit >= COOLDOWN
+                and ENTRY_START <= df["ts"].iloc[i] + pd.Timedelta(TIMEFRAME) < ENTRY_END
+            ):
                 pending_entry = True
 
     if position is not None:
@@ -553,7 +560,10 @@ def run_backtest_directional(df, variant):
             if not closed_this_bar:
                 bars_since_exit += 1
 
-            if bars_since_exit >= COOLDOWN:
+            if (
+                bars_since_exit >= COOLDOWN
+                and ENTRY_START <= df["ts"].iloc[i] + pd.Timedelta(TIMEFRAME) < ENTRY_END
+            ):
                 if variant == "B_LONG_SHORT":
                     if long_signals[i]:
                         pending_entry = 1
