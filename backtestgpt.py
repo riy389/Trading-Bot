@@ -590,6 +590,65 @@ def run_backtest_directional(df, variant):
     return trades
 
 
+
+def build_candle_diagnostics(df, trades):
+    """Export OHLC candles from signal through exit for every trade."""
+    rows = []
+
+    for trade_id, trade in enumerate(trades, start=1):
+        signal_ts = pd.Timestamp(trade["signal_ts"])
+        entry_ts = pd.Timestamp(trade["entry_ts"])
+        exit_ts = pd.Timestamp(trade["exit_ts"])
+        direction = int(trade["direction"])
+        sl = float(trade["sl"])
+
+        window = df[
+            (df["ts"] >= signal_ts) & (df["ts"] <= exit_ts)
+        ]
+
+        for _, candle in window.iterrows():
+            candle_ts = candle["ts"]
+            active = entry_ts <= candle_ts <= exit_ts
+            is_exit = candle_ts == exit_ts
+
+            sl_touched = False
+            if is_exit and trade["exit_reason"] == "stop_loss":
+                sl_touched = (
+                    candle["low"] <= sl if direction == 1
+                    else candle["high"] >= sl
+                )
+
+            rows.append({
+                "trade_id": trade_id,
+                "variant": trade["variant"],
+                "side": trade["side"],
+                "signal_ts": signal_ts,
+                "entry_ts": entry_ts,
+                "exit_ts": exit_ts,
+                "candle_ts": candle_ts,
+                "candle_role": (
+                    "signal" if candle_ts == signal_ts
+                    else "entry" if candle_ts == entry_ts
+                    else "exit" if is_exit
+                    else "holding"
+                ),
+                "position_active": active,
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+                "entry_price": trade["entry"],
+                "sl_price_at_exit": sl,
+                "tp_price": trade["tp"],
+                "exit_price": trade["exit_price"],
+                "exit_reason": trade["exit_reason"],
+                "exit_candle_range_contains_sl": sl_touched
+            })
+
+    return pd.DataFrame(rows)
+
+
+
 def main():
     print(f"Fetching {SYMBOL} native {TIMEFRAME} candles from Bitget...")
 
@@ -652,6 +711,9 @@ def main():
         ignore_index=True
     )
     trade_df.to_csv("eth_momentum_trades.csv", index=False)
+
+    diagnostics = build_candle_diagnostics(df, trade_df.to_dict("records"))
+    diagnostics.to_csv("eth_momentum_candle_diagnostics.csv", index=False)
 
     summary = {
         "symbol": SYMBOL,
