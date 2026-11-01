@@ -599,7 +599,8 @@ def build_candle_diagnostics(df, trades):
         signal_ts = pd.Timestamp(trade["signal_ts"])
         entry_ts = pd.Timestamp(trade["entry_ts"])
         exit_ts = pd.Timestamp(trade["exit_ts"])
-        direction = int(trade["direction"])
+        raw_direction = trade.get("direction", 1)
+        direction = int(raw_direction) if pd.notna(raw_direction) else 1
         sl = float(trade["sl"])
 
         window = df[
