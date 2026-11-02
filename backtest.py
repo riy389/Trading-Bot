@@ -1075,6 +1075,73 @@ def run_st(exchange):
           + fence + "\n" + pd.DataFrame(rows).drop(columns=["tf", "A", "ATR"]).to_string(index=False) + "\n" + fence)
 
 
+# ---------- SuperTrend Simple 5m: hitungan PERSIS tabel Pine (tanpa SL/TP, flip ke flip, tanpa biaya) ----------
+ST_PINE = True               # True: main() menjalankan run_st_pine (tanpa SL, hitungan persis Pine); False: run_st (bracket/flip dengan SL)
+ST_LAST_N = 71               # jumlah sinyal terakhir = jendela yang setara tabel di chart TradingView (Trades 71)
+
+
+def pine_stats(c, t, idx, sign, cost):
+    """Hitungan persis tabel Pine: tiap sinyal terfilter menutup trade sebelumnya di CLOSE sinyal itu (tanpa SL/TP) lalu membuka trade baru.
+    pnl = % harga; pnl > 0 = win, selebihnya loss; wr_pine = win / jumlah sinyal (trade terakhir yang masih terbuka ikut dihitung, seperti Pine).
+    cost = biaya round-trip (pecahan harga), dikurangkan per trade."""
+    if len(idx) < 2:
+        return {"n_sig": len(idx)}
+    ent, ex = c[idx[:-1]], c[idx[1:]]
+    pnl = sign[:-1] * (ex - ent) / ent * 100 - cost * 100
+    w, l = pnl[pnl > 0], pnl[pnl <= 0]
+    hold = (t[idx[1:]] - t[idx[:-1]]) / np.timedelta64(1, "h")
+    cum = np.cumsum(pnl)
+    dd = (cum - np.maximum.accumulate(np.r_[0.0, cum])[1:]).min()
+    return {"n_sig": len(idx), "wr_pine%": round(len(w) / len(idx) * 100, 1), "wr_closed%": round(len(w) / len(pnl) * 100, 1),
+            "avg_win%": round(float(w.mean()), 3) if len(w) else 0.0,
+            "avg_loss%": round(float(-l.mean()), 3) if len(l) else 0.0,
+            "PF": round(float(w.sum() / -l.sum()), 2) if l.sum() < 0 else float("inf"),
+            "sum%": round(float(pnl.sum()), 1), "worst%": round(float(pnl.min()), 2), "dd%": round(float(dd), 1),
+            "med_h": round(float(np.median(hold)), 1), "max_h": round(float(hold.max()), 1)}
+
+
+def run_st_pine(exchange):
+    df = fetch_ohlcv_cached(exchange, ST_SYMBOL, ST_TF, DAYS_BACK_TF[ST_TF])
+    dfh = fetch_ohlcv_cached(exchange, ST_SYMBOL, ST_HTF, DAYS_BACK_TF[ST_HTF])
+    if df is None or dfh is None or len(df) < 1000 or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, ST_TF)):
+        raise SystemExit("[!] Data 5m/1h tidak layak.")
+    s = st_signals(df, dfh)
+    c = df["close"].to_numpy(dtype=float)
+    t = df["ts"].dt.tz_convert(None).to_numpy("datetime64[ns]")
+    split = t[0] + (t[-1] - t[0]) / 2
+    fl, fs_ = s["bull"] & s["long_ok"], s["bear"] & s["short_ok"]
+    idx_f = np.flatnonzero(fl | fs_)
+    sg_f = np.where(fl[idx_f], 1, -1)
+    idx_r = np.flatnonzero(s["bull"] | s["bear"])
+    sg_r = np.where(s["bull"][idx_r], 1, -1)
+    rng = np.random.default_rng(1)
+    idx_x = np.sort(rng.choice(np.arange(EMA_N + 100, len(df)), size=len(idx_f), replace=False))
+    sg_x = np.where(rng.random(len(idx_x)) < 0.5, 1, -1)
+    cost_net = net_cost(ST_SYMBOL)
+    rows = []
+
+    def add(name, win, idx, sg):
+        for cname, cost in (("gross", 0.0), ("net", cost_net)):
+            rows.append({"set": name, "window": win, "cost": cname, "from": str(t[idx[0]])[:16],
+                         **pine_stats(c, t, idx, sg, cost)})
+
+    m = t[idx_f] < split
+    add("filtered", "full", idx_f, sg_f)
+    add("filtered", "IS", idx_f[m], sg_f[m])
+    add("filtered", "OOS", idx_f[~m], sg_f[~m])
+    add("filtered", f"last{ST_LAST_N}", idx_f[-ST_LAST_N:], sg_f[-ST_LAST_N:])
+    add("raw", "full", idx_r, sg_r)
+    add("random", "full", idx_x, sg_x)
+    fence = "`" * 3
+    _emit("\n### SuperTrend Simple 5m, hitungan PERSIS tabel Pine: entry = close sinyal terfilter, exit = close sinyal terfilter berikutnya, "
+          "tanpa SL/TP, pnl dalam % harga. gross = tanpa biaya (seperti klaim penulis), net = biaya " + f"{cost_net * 100:.2f}"
+          + "% per trade. filtered = flip + HTF/EMA200/RSI; raw = semua flip tanpa filter; random = sinyal acak (jumlah = filtered). "
+          "wr_pine = win / jumlah sinyal (cara Pine), PF = total win% / total loss%, worst% = rugi terbesar satu trade, dd% = drawdown "
+          "jumlah pnl (poin %), med_h / max_h = lama tahan antar sinyal (jam). Pembanding: chart TradingView kamu Trades 71, Winrate 54.1%, "
+          "PF sekitar 1.2; klaim penulis WR 55%, PF 2.2.\n"
+          + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -1089,7 +1156,7 @@ def main():
         check_st(exchange)
         if os.environ.get("CHECK_ONLY") == "1":
             return
-        run_st(exchange)
+        (run_st_pine if ST_PINE else run_st)(exchange)
         return
     check_signals(exchange)
     if os.environ.get("CHECK_ONLY") == "1":
