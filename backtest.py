@@ -917,6 +917,164 @@ def run_fixsl(exchange):
           + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
 
 
+# ---------- SuperTrend Simple 5 Minute (TradingView, TEV_Official), BTC 5m ----------
+ST_RUN = True                # True: main() hanya menjalankan tes SuperTrend Simple 5m lalu selesai (UT/FIXSL tidak jalan)
+ST_SYMBOL = "BTC/USDT:USDT"
+ST_TF, ST_HTF = "5m", "1h"
+ST_F, ST_P = 3.0, 10         # faktor dan periode ATR SuperTrend (default Pine = saran penulis untuk crypto)
+ST_RSI_N, ST_RSI_LV = 14, 50
+ST_TP_R = 2.0                # E2: TP = 2R
+# nama exit, trailing UT, TP tetap, keluar di flip mentah.
+# E1 = keluar di flip SuperTrend (versi penulis; SL awal 1R sebagai batas rugi). E2 = hanya SL 1R / TP 2R (sinyal saat posisi terbuka diabaikan).
+ST_EXITS = [("E1_flip", False, False, True), ("E2_sl_tp2R", False, True, False)]
+
+
+def _rma(x, length):
+    """ta.rma Pine: seed = SMA dari `length` nilai valid pertama."""
+    out = np.full(len(x), np.nan)
+    valid = np.flatnonzero(~np.isnan(x))
+    if len(valid) < length:
+        return out
+    s = valid[0] + length - 1
+    out[s] = x[valid[0]:s + 1].mean()
+    for i in range(s + 1, len(x)):
+        out[i] = (out[i - 1] * (length - 1) + x[i]) / length
+    return out
+
+
+def _rsi(close, n):
+    d = np.r_[np.nan, np.diff(close)]
+    up = np.where(np.isnan(d), np.nan, np.maximum(d, 0.0))
+    dn = np.where(np.isnan(d), np.nan, np.maximum(-d, 0.0))
+    ru, rd = _rma(up, n), _rma(dn, n)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(rd == 0, 100.0, np.where(ru == 0, 0.0, 100 - 100 / (1 + ru / rd)))
+
+
+def supertrend(df, factor=ST_F, period=ST_P):
+    """Port ta.supertrend (Pine v5). Return (garis, arah, atr); arah -1 = tren naik, 1 = turun, 0 = belum ada."""
+    h, l, c = (df[k].to_numpy(dtype=float) for k in ("high", "low", "close"))
+    atr = _rma_atr(h, l, c, period)
+    src = (h + l) / 2
+    n = len(c)
+    line = np.full(n, np.nan)
+    dirn = np.zeros(n, dtype=int)
+    lb_p = ub_p = st_p = float("nan")
+    for i in range(n):
+        a = atr[i]
+        if math.isnan(a):
+            lb = ub = st = float("nan")
+        else:
+            lb, ub = src[i] - factor * a, src[i] + factor * a
+            plb = 0.0 if math.isnan(lb_p) else lb_p
+            pub = 0.0 if math.isnan(ub_p) else ub_p
+            pc = c[i - 1] if i > 0 else float("nan")
+            lb = lb if (lb > plb or pc < plb) else plb
+            ub = ub if (ub < pub or pc > pub) else pub
+            if i == 0 or math.isnan(atr[i - 1]):
+                d = 1
+            elif st_p == ub_p:
+                d = -1 if c[i] > ub else 1
+            else:
+                d = 1 if c[i] < lb else -1
+            st = lb if d == -1 else ub
+            dirn[i] = d
+        line[i] = st
+        lb_p, ub_p, st_p = lb, ub, st
+    return line, dirn, atr
+
+
+def st_signals(df, dfh):
+    """Sinyal SuperTrend Simple: flip mentah (bull/bear) + syarat filter (long_ok/short_ok) di close candle df.
+    HTF = SuperTrend candle HTF terakhir yang sudah close pada saat candle df close (tanpa repaint)."""
+    line, d, atr = supertrend(df)
+    c = df["close"].to_numpy(dtype=float)
+    d1 = np.r_[0, d[:-1]]
+    ema = df["close"].ewm(span=EMA_N, adjust=False).mean().to_numpy(copy=True)
+    ema[:EMA_N] = np.nan
+    rsi = _rsi(c, ST_RSI_N)
+    _, dh, _ = supertrend(dfh)
+    th = (dfh["ts"] + pd.Timedelta(ST_HTF)).dt.tz_convert(None).to_numpy("datetime64[ns]")
+    t = (df["ts"] + pd.Timedelta(ST_TF)).dt.tz_convert(None).to_numpy("datetime64[ns]")
+    idx = np.searchsorted(th, t, side="right") - 1
+    hd = np.where(idx >= 0, dh[np.clip(idx, 0, None)], 0)
+    with np.errstate(invalid="ignore"):
+        long_ok = (hd == -1) & (c > ema) & (rsi > ST_RSI_LV)
+        short_ok = (hd == 1) & (c < ema) & (rsi < ST_RSI_LV)
+    return {"line": line, "atr": atr, "bull": (d == -1) & (d1 == 1), "bear": (d == 1) & (d1 == -1),
+            "long_ok": long_ok, "short_ok": short_ok, "ema": ema, "rsi": rsi, "htf": hd}
+
+
+def st_sets(df, s):
+    """Tiga set sinyal untuk simulate_ut: filtered (flip mentah, entry hanya kalau filter lolos; exit tetap di flip mentah),
+    raw (semua flip, tanpa filter), random (arah acak, jumlah sinyal = jumlah flip mentah, jarak R = 3 x ATR)."""
+    c = df["close"].to_numpy(dtype=float)
+    nl = np.abs(c - s["line"])                                   # 1R = jarak close sinyal ke garis SuperTrend
+    bias = np.where(s["long_ok"], 1, np.where(s["short_ok"], -1, 0))
+    rng = np.random.default_rng(1)
+    n = len(df)
+    hit = rng.random(n) < (s["bull"] | s["bear"]).sum() / n
+    side = rng.random(n) < 0.5
+    nl_r = ST_F * s["atr"]
+    stop_r = np.where(side, c - nl_r, c + nl_r)
+    return {"filtered": ((s["line"], s["bull"], s["bear"], nl), bias),
+            "raw": ((s["line"], s["bull"], s["bear"], nl), None),
+            "random": ((stop_r, hit & side, hit & ~side, nl_r), None)}
+
+
+def check_st(exchange):
+    """Cek cepat: sinyal port SuperTrend vs chart TradingView (BTC 5m, setelan default). Candle terakhir belum close, dibuang.
+    sig = flip mentah; lolos = filter HTF/EMA200/RSI lolos (hanya yang lolos tampil sebagai B/S di chart)."""
+    df = fetch_ohlcv(exchange, ST_SYMBOL, ST_TF, 5)
+    dfh = fetch_ohlcv(exchange, ST_SYMBOL, ST_HTF, 30)
+    if df is None or dfh is None:
+        return
+    df = df.iloc[:-1].reset_index(drop=True)
+    s = st_signals(df, dfh)
+    t = pd.DataFrame({
+        "utc": df["ts"].dt.tz_localize(None), "wib": (df["ts"] + pd.Timedelta(hours=7)).dt.tz_localize(None),
+        "sig": np.where(s["bull"], "B", np.where(s["bear"], "S", "")), "close": df["close"],
+        "st": s["line"].round(1), "htf": s["htf"], "ema200": s["ema"].round(1), "rsi": s["rsi"].round(1),
+        "lolos": np.where(s["bull"], s["long_ok"], np.where(s["bear"], s["short_ok"], False))})
+    t = t[t["sig"] != ""].tail(12)
+    _emit("\n### Cek sinyal SuperTrend Simple BTC 5m (waktu = waktu BUKA candle; htf: -1 naik, 1 turun)\n```\n"
+          + t.to_string(index=False) + "\n```")
+
+
+def run_st(exchange):
+    df = fetch_ohlcv_cached(exchange, ST_SYMBOL, ST_TF, DAYS_BACK_TF[ST_TF])
+    dfh = fetch_ohlcv_cached(exchange, ST_SYMBOL, ST_HTF, DAYS_BACK_TF[ST_HTF])
+    if df is None or dfh is None or len(df) < 1000 or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, ST_TF)):
+        raise SystemExit("[!] Data 5m/1h tidak layak.")
+    s = st_signals(df, dfh)
+    split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+    days = max((df["ts"].iloc[-1] - df["ts"].iloc[0]).days, 1)
+    cost_net = net_cost(ST_SYMBOL)
+    rows = []
+    for sname, (ut, bias) in st_sets(df, s).items():
+        for ename, trail_on, tp_on, rev in ST_EXITS:
+            trades = simulate_ut(df, ut, "free", True, trail_on, tp_on, None, bias, be_cost=cost_net,
+                                 close_end=True, tp_r=ST_TP_R, reverse=rev)
+            for cname, cost in (("net", cost_net), ("gross", 0.0)):
+                costed = apply_costs(trades, cost)
+                cap = [x for x in capital_sim(costed, ename, ST_SYMBOL, ST_TF)
+                       if x["risk_pct"] == 2.0 and x["policy"] == "skip"][0]
+                r = fs_row(ST_TF, ST_F, ST_P, f"{sname}_{ename}", costed, split_ts, cap, days)
+                r["cost"] = cname
+                r["pct_flip"] = round(float(np.mean([t["exit_reason"] == "reverse" for t in costed]) * 100), 1) if costed else None
+                if cname == "net" and costed and r["pf_IS"] is not None and r["pf_OOS"] is not None:
+                    r["LULUS"] = int(r["pf_IS"] >= 1.2 and r["pf_OOS"] >= 1.2 and r["netR"] > 0 and r["n_IS"] >= 30
+                                     and r["n_OOS"] >= 30 and 1 <= r["per_day"] <= 3 and r["med_h"] < 24)
+                rows.append(r)
+                print(f"  {sname} {ename} {cname}: {len(costed)} trade")
+    fence = "`" * 3
+    _emit("\n### SuperTrend Simple 5m (ST 3 / ATR 10, HTF 1h, EMA200, RSI 14/50), BTC, sesi free. net = biaya "
+          + f"{cost_net * 100:.2f}" + "%, gross = tanpa biaya. filtered = flip + filter; raw = semua flip; random = arah acak (jumlah = flip mentah). "
+          "E1_flip = keluar di flip mentah (SL awal 1R); E2_sl_tp2R = SL 1R / TP 2R. 1R = jarak close sinyal ke garis ST. "
+          "pct_flip = % exit lewat flip. LULUS (net) = PF IS dan OOS >= 1,2, netR > 0, n >= 30 per paruh, 1-3 trade/hari, med_h < 24\n"
+          + fence + "\n" + pd.DataFrame(rows).drop(columns=["tf", "A", "ATR"]).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -927,6 +1085,12 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
+    if ST_RUN:
+        check_st(exchange)
+        if os.environ.get("CHECK_ONLY") == "1":
+            return
+        run_st(exchange)
+        return
     check_signals(exchange)
     if os.environ.get("CHECK_ONLY") == "1":
         return
