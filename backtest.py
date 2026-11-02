@@ -83,7 +83,7 @@ OUTPUT_TRADES = "trades.csv"
 CHECK_UT = [(2, 1), (1, 10)]   # (a, periode ATR) untuk cek sinyal vs chart TradingView
 # simulasi modal kecil (versi net, periode full)
 CAP_START = 10.0             # modal awal (USDT) per pair
-CAP_MIN_NOTIONAL = 5.0       # order minimum (nilai posisi, USDT)
+CAP_MIN_NOTIONAL = 10.0       # order minimum (nilai posisi, USDT)
 CAP_MAX_LEV = 10.0           # leverage maksimum
 CAP_RISKS = [0.01, 0.02, 0.05, 0.10]   # risiko per trade (% ekuitas) yang diuji
 # ===========================================
@@ -278,7 +278,7 @@ def apply_costs(trades, cost):
 
 
 def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None,
-                be_cost=BE_COST, lock=None, close_end=False):
+                be_cost=BE_COST, lock=None, close_end=False, sl_fixed=None):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -302,6 +302,8 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
                 pos = None
             if pos is None and (pending == "long" or allow_short):
                 nl, tr_sig, e = nloss[i - 1], stop[i - 1], o[i]
+                if sl_fixed:
+                    nl = sl_fixed * e
                 sign = 1 if pending == "long" else -1
                 ok = (nl > 0 and nl / e >= MIN_SL_PCT and not math.isnan(tr_sig)
                       and (bias is None or bias[i - 1] == sign)  # filter arah EMA200 4h
@@ -689,7 +691,7 @@ def run_fixed_rr(exchange):
 
 
 # ---------- Swing 4h: funding, akun gabungan 12 pair, kriteria pooled ----------
-SWING = True                 # True: main() hanya menjalankan tes swing lalu selesai
+SWING = False                 # True: main() hanya menjalankan tes swing lalu selesai
 SW_GRID = [(a, 10) for a in range(1, 8)]   # A 1..7, ATR 10 (tetangga = A +/- 1)
 SW_ACC_A = [2, 6]            # A yang dijalankan di simulasi akun gabungan
 SW_CAPS = [10.0, 100.0, 1000.0]
@@ -848,6 +850,65 @@ def run_swing(exchange):
           + fence + "\n" + pd.DataFrame(acc).to_string(index=False) + "\n" + fence)
 
 
+FIXSL = True                 # True: main() hanya menjalankan tes SL tetap 2% lalu selesai
+FS_SYMBOL = "BTC/USDT:USDT"
+FS_PCT = 0.02                # SL tetap 2% harga dari entry = 1R
+FS_ATR = 10
+FS_A = {"5m": [8, 16, 32], "15m": [5, 10, 20], "1h": [3, 5, 10], "4h": [2, 4, 6]}   # perkiraan jarak trailing ~1/2/4% harga (belum diukur), dikunci sebelum lihat hasil
+FS_VARIANTS = [("trail", True, False), ("flip", False, False),
+               ("trail_ema4h", True, True), ("flip_ema4h", False, True)]
+
+
+def fs_row(tf, a, vname, costed, split_ts, cap):
+    r = {"tf": tf, "A": a, "var": vname, "n": len(costed)}
+    if not costed:
+        return r
+    d = pd.DataFrame(costed)
+    ism = (d["entry_ts"] < str(split_ts)).to_numpy()
+    hold = (pd.to_datetime(d["exit_ts"]) - pd.to_datetime(d["entry_ts"])).dt.total_seconds() / 3600
+    pf = lambda x: _pf_r(x) if len(x) else None
+    r.update({"n_IS": int(ism.sum()), "n_OOS": int((~ism).sum()),
+              "move%": round(float(d["gross_ret"].mean() * 100), 3),
+              "gross_R": round(float(d["gross_R"].mean()), 3),
+              "fee_R": round(float(d["fee_R"].mean()), 3),
+              "netR": round(float(d["net_R"].mean()), 3),
+              "pf_IS": pf(d.loc[ism, "net_R"]), "pf_OOS": pf(d.loc[~ism, "net_R"]),
+              "med_h": round(float(hold.median()), 1),
+              "pct_sl": round(float((d["exit_reason"] == "stop_loss").mean() * 100), 1),
+              "eq$10": cap["final_eq"], "dd%": cap["max_dd_pct"]})
+    return r
+
+
+def run_fixsl(exchange):
+    df4 = fetch_ohlcv_cached(exchange, FS_SYMBOL, "4h", DAYS_BACK_TF["4h"])
+    if df4 is None or len(df4) <= EMA_N:
+        raise SystemExit("[!] Data 4h tidak cukup untuk bias EMA200.")
+    cost = net_cost(FS_SYMBOL)
+    rows = []
+    for tf, alist in FS_A.items():
+        df = fetch_ohlcv_cached(exchange, FS_SYMBOL, tf, DAYS_BACK_TF[tf])
+        if df is None or len(df) < 100 or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, tf)):
+            print(f"  [!] Data {tf} tidak layak, skip.")
+            continue
+        bias = htf_bias(df, df4)
+        split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+        for a in alist:
+            ut = ut_bot(df, a, FS_ATR)
+            for vname, trail_on, use_b in FS_VARIANTS:
+                trades = simulate_ut(df, ut, "free", True, trail_on, False, None,
+                                     bias if use_b else None, be_cost=cost, close_end=True, sl_fixed=FS_PCT)
+                costed = apply_costs(trades, cost)
+                cap = [c for c in capital_sim(costed, vname, FS_SYMBOL, tf)
+                       if c["risk_pct"] == 2.0 and c["policy"] == "skip"][0]
+                rows.append(fs_row(tf, a, vname, costed, split_ts, cap))
+                print(f"  {tf} A={a} {vname}: {len(costed)} trade")
+    fence = "`" * 3
+    _emit("\n### SL tetap 2% harga, BTC, net (biaya " + f"{cost * 100:.2f}" + "%), 4 TF. move% = rata-rata gerak harga "
+          "per trade (gross), pct_sl = % exit kena SL, eq$10 / dd% = simulasi modal $10, risiko 2%, posisi min $"
+          + f"{CAP_MIN_NOTIONAL:g}" + " (dilewati kalau lebih kecil)\n"
+          + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -860,6 +921,9 @@ def main():
     exchange.load_markets()
     check_signals(exchange)
     if os.environ.get("CHECK_ONLY") == "1":
+        return
+    if FIXSL:
+        run_fixsl(exchange)
         return
     if FIXED_RR:
         run_fixed_rr(exchange)
