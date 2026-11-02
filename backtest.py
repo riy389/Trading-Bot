@@ -278,7 +278,7 @@ def apply_costs(trades, cost):
 
 
 def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None,
-                be_cost=BE_COST, lock=None, close_end=False, sl_fixed=None):
+                be_cost=BE_COST, lock=None, close_end=False, sl_fixed=None, tp_r=TP_R, reverse=True):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -297,7 +297,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
 
         # 2) eksekusi sinyal candle sebelumnya di open candle ini
         if pending is not None:
-            if pos is not None and pos["side"] != pending:
+            if pos is not None and pos["side"] != pending and reverse:
                 trades.append(_close(pos, tss[i], o[i], "reverse"))
                 pos = None
             if pos is None and (pending == "long" or allow_short):
@@ -311,7 +311,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
                       and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN))
                 if ok:
                     sl_pct = nl / e
-                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl, "tp": e + sign * TP_R * nl, "mfe": 0.0,
+                    pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl, "tp": e + sign * tp_r * nl, "mfe": 0.0,
                            "sl_pct": sl_pct, "size": RISK_PER_TRADE / sl_pct, "day": day[i]}
             pending = None
 
@@ -853,28 +853,33 @@ def run_swing(exchange):
 FIXSL = True                 # True: main() hanya menjalankan tes SL tetap 2% lalu selesai
 FS_SYMBOL = "BTC/USDT:USDT"
 FS_PCT = 0.02                # SL tetap 2% harga dari entry = 1R
-FS_ATR = 10
-FS_A = {"5m": [8, 16, 32], "15m": [5, 10, 20], "1h": [3, 5, 10], "4h": [2, 4, 6]}   # perkiraan jarak trailing ~1/2/4% harga (belum diukur), dikunci sebelum lihat hasil
-FS_VARIANTS = [("trail", True, False), ("flip", False, False),
-               ("trail_ema4h", True, True), ("flip_ema4h", False, True)]
+FS_ATRS = [10, 15, 20]       # periode ATR, pembanding
+FS_TP_R = 2.0                # TP tetap = 2R = 4% harga (SL 2% harga = 1R)
+FS_A = {"5m": [2, 4, 8], "15m": [2, 3, 5], "1h": [1, 2, 3], "4h": [1, 1.5, 2]}   # dikunci sebelum lihat hasil
+# nama, trailing UT, TP tetap, keluar di sinyal balik
+# bracket = keluar hanya di SL atau TP (sinyal saat posisi terbuka diabaikan); bracket_flip = juga keluar di sinyal balik
+FS_VARIANTS = [("bracket", False, True, False), ("bracket_flip", False, True, True)]
 
 
-def fs_row(tf, a, vname, costed, split_ts, cap):
-    r = {"tf": tf, "A": a, "var": vname, "n": len(costed)}
+def fs_row(tf, a, c, vname, costed, split_ts, cap, days):
+    r = {"tf": tf, "A": a, "ATR": c, "var": vname, "n": len(costed)}
     if not costed:
         return r
     d = pd.DataFrame(costed)
     ism = (d["entry_ts"] < str(split_ts)).to_numpy()
     hold = (pd.to_datetime(d["exit_ts"]) - pd.to_datetime(d["entry_ts"])).dt.total_seconds() / 3600
     pf = lambda x: _pf_r(x) if len(x) else None
-    r.update({"n_IS": int(ism.sum()), "n_OOS": int((~ism).sum()),
+    r.update({"per_day": round(len(d) / days, 2),
+              "n_IS": int(ism.sum()), "n_OOS": int((~ism).sum()),
               "move%": round(float(d["gross_ret"].mean() * 100), 3),
               "gross_R": round(float(d["gross_R"].mean()), 3),
               "fee_R": round(float(d["fee_R"].mean()), 3),
               "netR": round(float(d["net_R"].mean()), 3),
+              "wr%": round(float((d["net_R"] > 0).mean() * 100), 1),
               "pf_IS": pf(d.loc[ism, "net_R"]), "pf_OOS": pf(d.loc[~ism, "net_R"]),
               "med_h": round(float(hold.median()), 1),
               "pct_sl": round(float((d["exit_reason"] == "stop_loss").mean() * 100), 1),
+              "pct_tp": round(float((d["exit_reason"] == "tp_fixed").mean() * 100), 1),
               "eq$10": cap["final_eq"], "dd%": cap["max_dd_pct"]})
     return r
 
@@ -890,21 +895,24 @@ def run_fixsl(exchange):
         if df is None or len(df) < 100 or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, tf)):
             print(f"  [!] Data {tf} tidak layak, skip.")
             continue
-        bias = htf_bias(df, df4)
         split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+        days = max((df["ts"].iloc[-1] - df["ts"].iloc[0]).days, 1)
         for a in alist:
-            ut = ut_bot(df, a, FS_ATR)
-            for vname, trail_on, use_b in FS_VARIANTS:
-                trades = simulate_ut(df, ut, "free", True, trail_on, False, None,
-                                     bias if use_b else None, be_cost=cost, close_end=True, sl_fixed=FS_PCT)
-                costed = apply_costs(trades, cost)
-                cap = [c for c in capital_sim(costed, vname, FS_SYMBOL, tf)
-                       if c["risk_pct"] == 2.0 and c["policy"] == "skip"][0]
-                rows.append(fs_row(tf, a, vname, costed, split_ts, cap))
-                print(f"  {tf} A={a} {vname}: {len(costed)} trade")
+            for c in FS_ATRS:
+                ut = ut_bot(df, a, c)
+                for vname, trail_on, tp_on, rev in FS_VARIANTS:
+                    trades = simulate_ut(df, ut, "free", True, trail_on, tp_on, None, None,
+                                         be_cost=cost, close_end=True, sl_fixed=FS_PCT,
+                                         tp_r=FS_TP_R, reverse=rev)
+                    costed = apply_costs(trades, cost)
+                    cap = [x for x in capital_sim(costed, vname, FS_SYMBOL, tf)
+                           if x["risk_pct"] == 2.0 and x["policy"] == "skip"][0]
+                    rows.append(fs_row(tf, a, c, vname, costed, split_ts, cap, days))
+                    print(f"  {tf} A={a} ATR={c} {vname}: {len(costed)} trade")
     fence = "`" * 3
-    _emit("\n### SL tetap 2% harga, BTC, net (biaya " + f"{cost * 100:.2f}" + "%), 4 TF. move% = rata-rata gerak harga "
-          "per trade (gross), pct_sl = % exit kena SL, eq$10 / dd% = simulasi modal $10, risiko 2%, posisi min $"
+    _emit("\n### SL 2% + TP 2R (4% harga), BTC, net (biaya " + f"{cost * 100:.2f}" + "%), sesi free. per_day = trade per hari, "
+          "move% = rata-rata gerak harga per trade (gross), wr% = win rate net (impas sekitar 36%), "
+          "pct_sl / pct_tp = % exit kena SL / TP, eq$10 / dd% = simulasi modal $10, risiko 2%, posisi min $"
           + f"{CAP_MIN_NOTIONAL:g}" + " (dilewati kalau lebih kecil)\n"
           + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
 
