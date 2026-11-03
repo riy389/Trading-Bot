@@ -26,19 +26,13 @@ jobs:
           key: candles-${{ github.run_id }}
           restore-keys: candles-
 
-      - name: Run ETH Momentum Breakout
-        run: python3 backtestgpt.py
-
-      - name: Evaluate ETH Momentum Breakout
-        run: python3 evaluate.py --eth
+      - name: Run Ichimoku Backtest
+        run: python3 ichimoku_backtest.py
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: eth-momentum-breakout-results
-          path: |
-            eth_momentum_summary.json
-            eth_momentum_trades.csv
-            eth_momentum_evaluation.md
+          name: ichimoku-backtest-results
+          path: ichimoku_*
           if-no-files-found: warn
