@@ -1142,6 +1142,147 @@ def run_st_pine(exchange):
           + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
 
 
+# ---------- The Tits (TradingView, O_Positive): persilangan nol histogram MACD 9/13/9, BTC ----------
+TT_RUN = True                # True: main() hanya menjalankan tes The Tits lalu selesai (ST/UT tidak jalan)
+TT_SYMBOL = "BTC/USDT:USDT"
+TT_TFS = ["15m", "1h", "4h"]
+TT_FAST, TT_SLOW, TT_SIG = 9, 13, 9
+TT_SL_LAG = 0                # B: SL = open candle HA sinyal (candle terakhir yang sudah close saat entry); 1 = open candle HA sebelumnya
+
+
+def _ema_pine(x, length):
+    """ta.ema Pine: seed = SMA dari `length` nilai valid pertama, lalu alpha = 2 / (length + 1)."""
+    out = np.full(len(x), np.nan)
+    valid = np.flatnonzero(~np.isnan(x))
+    if len(valid) < length:
+        return out
+    s = valid[0] + length - 1
+    out[s] = x[valid[0]:s + 1].mean()
+    k = 2.0 / (length + 1)
+    for i in range(s + 1, len(x)):
+        out[i] = k * x[i] + (1 - k) * out[i - 1]
+    return out
+
+
+def heikin_ashi(df):
+    """Open dan close candle Heikin Ashi seperti chart TradingView."""
+    o, h, l, c = (df[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
+    hc = (o + h + l + c) / 4
+    ho = np.empty(len(c))
+    ho[0] = (o[0] + c[0]) / 2
+    for i in range(1, len(c)):
+        ho[i] = (ho[i - 1] + hc[i - 1]) / 2
+    return ho, hc
+
+
+def tits_cross(src):
+    """Persilangan nol delta = MACD - sinyal (kode Pine: EMA 9 - EMA 13, sinyal EMA 9). Return (naik, turun)."""
+    macd = _ema_pine(src, TT_FAST) - _ema_pine(src, TT_SLOW)
+    delta = macd - _ema_pine(macd, TT_SIG)
+    d1 = np.r_[np.nan, delta[:-1]]
+    with np.errstate(invalid="ignore"):
+        return (delta > 0) & (d1 <= 0), (delta < 0) & (d1 >= 0)
+
+
+def tt_sl_level(ho):
+    """Level SL cara penulis: open candle HA sinyal (TT_SL_LAG = 0) atau satu candle sebelumnya (1)."""
+    return np.r_[np.full(TT_SL_LAG, np.nan), ho[:len(ho) - TT_SL_LAG]]
+
+
+def check_tt(exchange):
+    """Cek cepat BTC 1h: persilangan kode persis (A, candle biasa) dan versi HA (B). entry = open candle SESUDAH sinyal.
+    Candle terakhir belum close, dibuang. ha_open = level SL cara penulis."""
+    df = fetch_ohlcv(exchange, TT_SYMBOL, "1h", 25)
+    if df is None:
+        return
+    df = df.iloc[:-1].reset_index(drop=True)
+    up, dn = tits_cross(df["close"].to_numpy(dtype=float))
+    ho, hc = heikin_ashi(df)
+    upb, dnb = tits_cross(hc)
+    t = pd.DataFrame({"entry_utc": (df["ts"] + pd.Timedelta("1h")).dt.tz_localize(None),
+                      "entry_wib": (df["ts"] + pd.Timedelta(hours=8)).dt.tz_localize(None),
+                      "A": np.where(up, "L", np.where(dn, "S", "")), "B_ha": np.where(upb, "L", np.where(dnb, "S", "")),
+                      "close": df["close"], "sl_B": np.round(tt_sl_level(ho), 1)})
+    t = t[(t["A"] != "") | (t["B_ha"] != "")].tail(14)
+    _emit("\n### Cek sinyal The Tits BTC 1h. A = kode persis (candle biasa), B_ha = sinyal di candle Heikin Ashi, "
+          "sl_B = level SL cara penulis. L = long, S = short\n```\n" + t.to_string(index=False) + "\n```")
+
+
+def run_tits(exchange):
+    cost_net = net_cost(TT_SYMBOL)
+    rows_a, rows_b = [], []
+    for tf in TT_TFS:
+        df = fetch_ohlcv_cached(exchange, TT_SYMBOL, tf, DAYS_BACK_TF[tf])
+        if df is None or len(df) < 500 or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, tf)):
+            print(f"  [!] Data {tf} tidak layak, skip.")
+            continue
+        n = len(df)
+        o = df["open"].to_numpy(dtype=float)
+        c = df["close"].to_numpy(dtype=float)
+        t = df["ts"].dt.tz_convert(None).to_numpy("datetime64[ns]")
+        split = t[0] + (t[-1] - t[0]) / 2
+        split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+        days = max((df["ts"].iloc[-1] - df["ts"].iloc[0]).days, 1)
+        rng = np.random.default_rng(1)
+
+        # A: kode persis. Selalu di pasar, sinyal di close candle i, order terisi di open candle i+1, tanpa SL/TP.
+        up, dn = tits_cross(c)
+        sig = up | dn
+        sig[-1] = False
+        ix = np.flatnonzero(sig)
+        sg = np.where(up[ix], 1, -1)
+        px = np.r_[o[1:], np.nan]
+        ix_x = np.sort(rng.choice(np.arange(60, n - 1), size=len(ix), replace=False))
+        sg_x = np.where(rng.random(len(ix_x)) < 0.5, 1, -1)
+        m = t[ix] < split
+
+        def add_a(name, win, i_, s_):
+            for cname, cost in (("gross", 0.0), ("net", cost_net)):
+                rows_a.append({"tf": tf, "set": name, "window": win, "cost": cname, **pine_stats(px, t, i_, s_, cost)})
+        add_a("macd", "full", ix, sg)
+        add_a("macd", "IS", ix[m], sg[m])
+        add_a("macd", "OOS", ix[~m], sg[~m])
+        add_a("random", "full", ix_x, sg_x)
+
+        # B: cara penulis. Sinyal MACD di candle HA, SL = open candle HA (level dari chart HA, harga nyata dicek intrabar),
+        # exit di SL atau sinyal berlawanan (reverse). 1R = jarak entry ke SL.
+        ho, hc = heikin_ashi(df)
+        upb, dnb = tits_cross(hc)
+        lvl = tt_sl_level(ho)
+        nl = np.abs(c - lvl)
+        n_sig = int((upb | dnb).sum())
+        hit = rng.random(n) < n_sig / n
+        side = rng.random(n) < 0.5
+        for sname, ut in (("macd_ha", (lvl, upb, dnb, nl)), ("random", (lvl, hit & side, hit & ~side, nl))):
+            trades = simulate_ut(df, ut, "free", True, False, False, None, None, be_cost=cost_net,
+                                 close_end=True, reverse=True)
+            for cname, cost in (("net", cost_net), ("gross", 0.0)):
+                costed = apply_costs(trades, cost)
+                cap = [x for x in capital_sim(costed, sname, TT_SYMBOL, tf)
+                       if x["risk_pct"] == 2.0 and x["policy"] == "skip"][0]
+                r = fs_row(tf, 0, 0, sname + "_SL_flip", costed, split_ts, cap, days)
+                r["cost"] = cname
+                r["n_sig"] = n_sig if sname == "macd_ha" else int((hit).sum())
+                r["pct_flip"] = round(float(np.mean([x["exit_reason"] == "reverse" for x in costed]) * 100), 1) if costed else None
+                if cname == "net" and costed and r.get("pf_IS") is not None and r.get("pf_OOS") is not None:
+                    r["edge"] = int(r["pf_IS"] >= 1.2 and r["pf_OOS"] >= 1.2 and r["netR"] > 0 and r["n_IS"] >= 30 and r["n_OOS"] >= 30)
+                    r["intraday"] = int(1 <= r["per_day"] <= 3 and r["med_h"] < 24)
+                rows_b.append(r)
+                print(f"  {tf} {sname} {cname}: {len(costed)} trade")
+    fence = "`" * 3
+    _emit("\n### The Tits A = KODE PERSIS (MACD 9/13/9, candle biasa, selalu di pasar, order di open candle sesudah sinyal, tanpa SL/TP, pnl % harga). "
+          "gross = tanpa biaya, net = biaya " + f"{cost_net * 100:.2f}" + "% per trade. random = sinyal acak (jumlah sama). "
+          "wr_pine = win / jumlah sinyal, PF = total win% / total loss%, worst% = rugi terbesar satu trade, "
+          "dd% = drawdown jumlah pnl (poin %), med_h / max_h = lama tahan (jam)\n"
+          + fence + "\n" + pd.DataFrame(rows_a).to_string(index=False) + "\n" + fence)
+    _emit("\n### The Tits B = CARA PENULIS (sinyal MACD di candle Heikin Ashi, SL = open candle HA sinyal, exit di SL atau sinyal berlawanan, "
+          "tanpa TP, tanpa cooldown). 1R = jarak entry ke SL. random = sinyal acak dengan aturan SL sama (entry dilewati kalau SL di sisi salah). "
+          "n_sig = jumlah sinyal, n = trade yang terisi. edge = PF IS dan OOS >= 1,2, netR > 0, n >= 30 per paruh; "
+          "intraday = 1-3 trade/hari dan med_h < 24\n"
+          + fence + "\n" + pd.DataFrame(rows_b).drop(columns=["A", "ATR", "pct_tp", "eq$10"], errors="ignore").to_string(index=False)
+          + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -1152,6 +1293,12 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
+    if TT_RUN:
+        check_tt(exchange)
+        if os.environ.get("CHECK_ONLY") == "1":
+            return
+        run_tits(exchange)
+        return
     if ST_RUN:
         check_st(exchange)
         if os.environ.get("CHECK_ONLY") == "1":
