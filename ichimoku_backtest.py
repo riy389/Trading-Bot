@@ -215,6 +215,11 @@ def evaluate(rows):
         is_pf = is_row["profit_factor"]
         oos_pf = oos_row["profit_factor"]
 
+        if is_pf == "inf":
+            is_pf = float("inf")
+        if oos_pf == "inf":
+            oos_pf = float("inf")
+
         passed = (
             isinstance(is_pf, (int, float))
             and is_pf > 1
