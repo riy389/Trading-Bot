@@ -1420,6 +1420,61 @@ def run_regime(exchange):
           + fence + "\n" + pd.DataFrame(ctl).to_string(index=False) + "\n" + fence)
 
 
+# ---------- Uji mesin (known-answer): buy & hold, dua jalur hitung The Tits, strategi oracle ----------
+SAN_RUN = True               # True: main() hanya menjalankan uji mesin lalu selesai
+
+
+def run_sanity(exchange):
+    df = fetch_ohlcv_cached(exchange, TT_SYMBOL, "1h", DAYS_BACK_TF["1h"])
+    if df is None or len(df) < 500:
+        raise SystemExit("[!] Data 1h tidak layak.")
+    o, c = df["open"].to_numpy(dtype=float), df["close"].to_numpy(dtype=float)
+    n = len(df)
+    cost = net_cost(TT_SYMBOL)
+    none = np.zeros(n, bool)
+
+    def engine(buy, sell, stop, close_end):
+        # SL = 95% harga (tidak pernah kena), TP tidak ada: exit hanya lewat sinyal balik (atau akhir data)
+        return simulate_ut(df, (stop, buy, sell, 0.95 * c), "free", True, False, False, None, None,
+                           be_cost=cost, close_end=close_end)
+
+    # 1) buy & hold lewat mesin: hasilnya harus sama dengan perubahan harga open candle 100 -> close terakhir
+    buy = none.copy()
+    buy[99] = True
+    tr = engine(buy, none, 0.5 * c, True)
+    eng, price = tr[0]["gross_ret"] * 100, (c[-1] / o[100] - 1) * 100
+    r1 = {"uji": "1 buy&hold", "info": f"long open {str(df['ts'].iloc[100])[:16]} {o[100]:.1f} -> close terakhir {c[-1]:.1f}",
+          "mesin%": round(eng, 4), "pembanding%": round(price, 4), "selisih": f"{abs(eng - price):.2e}"}
+
+    # 2) The Tits A lewat dua jalur: pine_stats (selisih harga antar sinyal) vs simulate_ut. Harus identik.
+    up, dn = tits_cross(c)
+    sig = up | dn
+    sig[-1] = False
+    ix = np.flatnonzero(sig)
+    sg = np.where(up[ix], 1, -1)
+    tr = engine(up & sig, dn & sig, np.where(up, 0.5 * c, 1.5 * c), False)
+    e_pnl = np.array([t["gross_ret"] for t in tr]) * 100
+    p_pnl = sg[:-1] * (o[ix[1:] + 1] - o[ix[:-1] + 1]) / o[ix[:-1] + 1] * 100
+    same = len(e_pnl) == len(p_pnl)
+    r2 = {"uji": "2 The Tits A, dua jalur", "info": f"trade mesin {len(e_pnl)} vs hitungan langsung {len(p_pnl)}",
+          "mesin%": round(float(e_pnl.sum()), 3), "pembanding%": round(float(p_pnl.sum()), 3),
+          "selisih": f"{np.abs(e_pnl - p_pnl).max():.2e}" if same else "jumlah trade beda"}
+
+    # 3) oracle: tahu arah 4 jam ke depan (close[i+4] > close[i]), exit di sinyal balik. Harus untung besar dan win rate tinggi.
+    fut = np.r_[c[4:] > c[:-4], np.zeros(4, bool)]
+    buy_o, sell_o = fut.copy(), ~fut
+    buy_o[-4:] = sell_o[-4:] = False
+    tr = engine(buy_o, sell_o, np.where(buy_o, 0.5 * c, 1.5 * c), False)
+    g = np.array([t["gross_ret"] for t in tr]) * 100
+    r3 = {"uji": "3 oracle 4 jam", "info": f"{len(g)} trade, win rate gross {(g > 0).mean() * 100:.1f}%, PF gross {_pf_r(g)}, "
+          f"PF net {_pf_r(g - cost * 100)}", "mesin%": round(float(g.sum()), 1), "pembanding%": round(float((g - cost * 100).sum()), 1),
+          "selisih": "mesin% = jumlah gross, pembanding% = jumlah net"}
+    fence = "`" * 3
+    _emit("\n### Uji mesin (known-answer), BTC 1h. 1: buy & hold lewat mesin harus sama dengan perubahan harga (cek harga di chart). "
+          "2: The Tits A dihitung dua jalur kode berbeda, harus identik. 3: strategi oracle (tahu arah 4 jam ke depan) harus untung besar\n"
+          + fence + "\n" + pd.DataFrame([r1, r2, r3]).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -1430,6 +1485,9 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
+    if SAN_RUN:
+        run_sanity(exchange)
+        return
     if RG_RUN:
         audit_tits(exchange)
         run_regime(exchange)
