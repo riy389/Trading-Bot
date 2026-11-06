@@ -1,0 +1,29 @@
+name: ICT Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ccxt pandas numpy
+      - name: Restore OHLCV cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: ict-btc-15m-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            ict-btc-15m-${{ runner.os }}-
+      - name: Run ICT backtest
+        run: python ict_backtest.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ict-backtest-results
+          path: |
+            ict_summary.csv
+            ict_trades.csv
