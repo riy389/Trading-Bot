@@ -278,7 +278,8 @@ def apply_costs(trades, cost):
 
 
 def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None,
-                be_cost=BE_COST, lock=None, close_end=False, sl_fixed=None, tp_r=TP_R, reverse=True):
+                be_cost=BE_COST, lock=None, close_end=False, sl_fixed=None, tp_r=TP_R, reverse=True,
+                cooldown=None):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -289,6 +290,7 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
     tod, day = _time_arrays(df)
     tss = df["ts"].tolist()
     trades, pos, pending = [], None, None
+    cooldown_until = -1   # index candle: entry baru diblokir selama i <= cooldown_until
     for i in range(1, len(df)):
         # 1) tutup paksa akhir sesi
         if pos is not None and session == "24h" and (day[i] > pos["day"] or tod[i] >= SESSION_CLOSE_MIN):
@@ -308,7 +310,8 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
                 ok = (nl > 0 and nl / e >= MIN_SL_PCT and not math.isnan(tr_sig)
                       and (bias is None or bias[i - 1] == sign)  # filter arah EMA200 4h
                       and sign * (e - tr_sig) > 0                    # open belum melewati garis UT
-                      and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN))
+                      and (session == "free" or tod[i] <= SESSION_LAST_ENTRY_MIN)
+                      and i > cooldown_until)                        # belum lewat masa cooldown setelah SL
                 if ok:
                     sl_pct = nl / e
                     pos = {"side": pending, "ts": tss[i], "entry": e, "sl": e - sign * nl, "tp": e + sign * tp_r * nl, "mfe": 0.0,
@@ -349,6 +352,8 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
             if reason is not None:
                 trades.append(_close(pos, tss[i], fill, reason))
                 pos = None
+                if cooldown and reason in ("stop_loss", "be_stop", "lock_stop"):
+                    cooldown_until = i + cooldown
             else:
                 ext = h[i] if sign == 1 else l[i]
                 pos["mfe"] = max(pos["mfe"], sign * (ext - pos["entry"]) / (pos["entry"] * pos["sl_pct"]))
@@ -607,6 +612,7 @@ def frr_sim(df, buy, sell, bias, resolve):
     tss = df["ts"].tolist()
     P = FRR_PCT
     trades, pos, pending = [], None, None
+    cooldown_until = -1   # index candle: entry baru diblokir selama i <= cooldown_until
     for i in range(1, len(df)):
         if pending is not None:
             sign = 1 if pending == "long" else -1
@@ -1147,7 +1153,8 @@ TT_RUN = True                # True: main() hanya menjalankan tes The Tits lalu 
 TT_SYMBOL = "BTC/USDT:USDT"
 TT_TFS = ["15m", "1h", "4h"]
 TT_FAST, TT_SLOW, TT_SIG = 9, 13, 9
-TT_SL_LAG = 0                # B: SL = open candle HA sinyal (candle terakhir yang sudah close saat entry); 1 = open candle HA sebelumnya
+TT_SL_LAG = 1                # B: SL = open candle HA sinyal (candle terakhir yang sudah close saat entry); 1 = open candle HA sebelumnya
+TT_COOLDOWN = 3               # B: jumlah candle jeda setelah exit kena SL sebelum boleh entry baru lagi (0 = tanpa cooldown)
 
 
 def _ema_pine(x, length):
@@ -1254,8 +1261,9 @@ def run_tits(exchange):
         hit = rng.random(n) < n_sig / n
         side = rng.random(n) < 0.5
         for sname, ut in (("macd_ha", (lvl, upb, dnb, nl)), ("random", (lvl, hit & side, hit & ~side, nl))):
+            cd = TT_COOLDOWN if sname == "macd_ha" else 0
             trades = simulate_ut(df, ut, "free", True, False, False, None, None, be_cost=cost_net,
-                                 close_end=True, reverse=True)
+                                 close_end=True, reverse=True, cooldown=cd)
             for cname, cost in (("net", cost_net), ("gross", 0.0)):
                 costed = apply_costs(trades, cost)
                 cap = [x for x in capital_sim(costed, sname, TT_SYMBOL, tf)
