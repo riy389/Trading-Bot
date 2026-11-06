@@ -200,7 +200,7 @@ def find_setups(df):
             continue
 
         # FVG: displacement pada candle sebelumnya dan gap tiga candle.
-        if state["side"] == 1 and i >= 2:
+        if state["side"] == 1 and "fvg" not in state and i >= 2:
             if (df.iloc[i - 1]["displacement_up"]
                     and row["low"] > df.iloc[i - 2]["high"]):
                 state["fvg"] = (
@@ -209,7 +209,7 @@ def find_setups(df):
                 )
                 state["fvg_i"] = i
 
-        elif state["side"] == -1 and i >= 2:
+        elif state["side"] == -1 and "fvg" not in state and i >= 2:
             if (df.iloc[i - 1]["displacement_down"]
                     and row["high"] < df.iloc[i - 2]["low"]):
                 state["fvg"] = (
@@ -236,11 +236,11 @@ def find_setups(df):
                 state = None
 
         else:
-            if row["high"] > bottom:
+            if row["high"] > top:
                 state = None
                 continue
-            if row["high"] >= top and row["low"] <= bottom:
-                entry = top
+            if row["high"] >= bottom and row["low"] <= top:
+                entry = bottom
                 sl = state["extreme"] + ATR_BUFFER * row["atr"]
                 risk = sl - entry
                 if risk > 0:
