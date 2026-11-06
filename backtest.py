@@ -1283,6 +1283,143 @@ def run_tits(exchange):
           + "\n" + fence)
 
 
+# ---------- Tes label regime (market reader): return ke depan per label + audit trade The Tits ----------
+RG_RUN = True                # True: main() hanya menjalankan audit The Tits + tes label regime lalu selesai
+RG_COMBOS = [("1h", 4), ("1h", 24), ("4h", 1), ("4h", 6)]   # (timeframe label, horizon ke depan dalam candle); semua <= 24 jam
+RG_ADX_N, RG_ADX_TREND, RG_ADX_RANGE, RG_EMA_N = 14, 25, 20, 50
+RG_SHUFFLES = 30
+RG_NAMES = {1: "TREND_UP", -1: "TREND_DOWN", 0: "RANGE", 2: "NONE"}
+
+
+def regime_labels(df):
+    """Label di close tiap candle: 1 TREND_UP (ADX >= 25, +DI > -DI, close > EMA50), -1 TREND_DOWN (ADX >= 25, -DI > +DI,
+    close < EMA50), 0 RANGE (ADX < 20), 2 NONE (sisanya), -9 = masa pemanasan (200 candle awal)."""
+    h, l, c = (df[k].to_numpy(dtype=float) for k in ("high", "low", "close"))
+    up = np.r_[np.nan, np.diff(h)]
+    dn = np.r_[np.nan, -np.diff(l)]
+    with np.errstate(invalid="ignore"):
+        pdm = np.where((up > dn) & (up > 0), up, 0.0)
+        mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    pdm[0] = mdm[0] = np.nan
+    tr = np.r_[np.nan, np.maximum.reduce([h[1:] - l[1:], np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])])]
+    atr = _rma(tr, RG_ADX_N)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pdi, mdi = 100 * _rma(pdm, RG_ADX_N) / atr, 100 * _rma(mdm, RG_ADX_N) / atr
+        s = pdi + mdi
+        adx = _rma(100 * np.abs(pdi - mdi) / np.where(s == 0, 1.0, s), RG_ADX_N)
+    ema = _ema_pine(c, RG_EMA_N)
+    with np.errstate(invalid="ignore"):
+        lab = np.where((adx >= RG_ADX_TREND) & (pdi > mdi) & (c > ema), 1,
+                       np.where((adx >= RG_ADX_TREND) & (mdi > pdi) & (c < ema), -1,
+                                np.where(adx < RG_ADX_RANGE, 0, 2)))
+    lab[:200] = -9
+    lab[~np.isfinite(adx) | ~np.isfinite(ema)] = -9
+    return lab
+
+
+def regime_samples(df, lab, H):
+    """Per candle i (label di close i): ret = return dari OPEN candle i+1 ke CLOSE candle i+H; past = return H candle ke belakang.
+    Hanya tiap H candle sekali (tidak tumpang tindih)."""
+    o, c = df["open"].to_numpy(dtype=float), df["close"].to_numpy(dtype=float)
+    n = len(c)
+    ret = np.full(n, np.nan)
+    ret[:n - H] = c[H:] / o[1:n - H + 1] - 1
+    past = np.full(n, np.nan)
+    past[H:] = c[H:] / c[:n - H] - 1
+    i = np.arange(n)
+    ok = (lab != -9) & np.isfinite(ret) & np.isfinite(past) & (i % H == 0)
+    return ret[ok], past[ok], lab[ok], i[ok] >= n // 2
+
+
+def _sgn(lab, past):
+    """Arah trade per label: UP = long, DOWN = short, RANGE = lawan gerak H candle terakhir (fade), NONE = tidak trade."""
+    with np.errstate(invalid="ignore"):
+        return np.where(lab == 1, 1.0, np.where(lab == -1, -1.0, np.where(lab == 0, -np.sign(past), np.nan)))
+
+
+def audit_tits(exchange):
+    """12 trade tertutup terakhir The Tits A (kode persis) BTC 1h, untuk dicocokkan dengan daftar trade Strategy Tester."""
+    df = fetch_ohlcv_cached(exchange, TT_SYMBOL, "1h", DAYS_BACK_TF["1h"])
+    if df is None:
+        return
+    o = df["open"].to_numpy(dtype=float)
+    up, dn = tits_cross(df["close"].to_numpy(dtype=float))
+    sig = up | dn
+    sig[-1] = False
+    ix = np.flatnonzero(sig)[-13:]
+    cost = net_cost(TT_SYMBOL) * 100
+    rows = []
+    for k in range(len(ix) - 1):
+        e, x = ix[k] + 1, ix[k + 1] + 1
+        s = 1 if up[ix[k]] else -1
+        g = s * (o[x] - o[e]) / o[e] * 100
+        rows.append({"side": "L" if s == 1 else "S", "entry_utc": df["ts"].iloc[e].tz_localize(None), "entry_px": o[e],
+                     "exit_utc": df["ts"].iloc[x].tz_localize(None), "exit_px": o[x],
+                     "gross%": round(g, 3), "net%": round(g - cost, 3)})
+    _emit("\n### Audit The Tits A, BTC 1h: 12 trade tertutup terakhir (entry/exit = open candle sesudah sinyal, harga Bitget swap). "
+          "Cocokkan dengan daftar trade Strategy Tester kamu\n```\n" + pd.DataFrame(rows).to_string(index=False) + "\n```")
+
+
+def run_regime(exchange):
+    store = {cb: [] for cb in RG_COMBOS}
+    for symbol in PAIRS:
+        cost = net_cost(symbol) * 100
+        for tf in sorted({t_ for t_, _ in RG_COMBOS}):
+            df = fetch_ohlcv_cached(exchange, symbol, tf, DAYS_BACK_TF[tf])
+            if df is None or len(df) < 500 or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, tf)):
+                print(f"  [!] Data {symbol} {tf} tidak layak, skip.")
+                continue
+            lab = regime_labels(df)
+            for t_, H in RG_COMBOS:
+                if t_ == tf:
+                    store[(t_, H)].append((symbol == TT_SYMBOL, cost) + regime_samples(df, lab, H))
+    rows, ctl = [], []
+    rng = np.random.default_rng(1)
+    for (tf, H), parts in store.items():
+        if not parts:
+            continue
+        ret = np.concatenate([p[2] for p in parts]) * 100
+        past = np.concatenate([p[3] for p in parts])
+        lab = np.concatenate([p[4] for p in parts])
+        oos = np.concatenate([p[5] for p in parts])
+        btc = np.concatenate([np.full(len(p[2]), p[0]) for p in parts])
+        cost = np.concatenate([np.full(len(p[2]), p[1]) for p in parts])
+        edge = _sgn(lab, past) * ret
+        net = edge - cost
+        for scope, m in (("pooled", np.ones(len(ret), bool)), ("BTC", btc)):
+            for code, name in RG_NAMES.items():
+                k = m & (lab == code)
+                if k.sum() == 0:
+                    continue
+                r = {"scope": scope, "tf": tf, "H": H, "label": name, "n": int(k.sum()), "share%": round(k.sum() / m.sum() * 100, 1),
+                     "fwd%": round(ret[k].mean(), 3), "abs%": round(np.abs(ret[k]).mean(), 3)}
+                e = edge[k]
+                if code != 2 and len(e) > 30:
+                    r.update({"edge%": round(e.mean(), 3), "t": round(e.mean() / (e.std(ddof=1) / np.sqrt(len(e))), 1),
+                              "net%": round(net[k].mean(), 3), "edge_IS": round(e[~oos[k]].mean(), 3),
+                              "edge_OOS": round(e[oos[k]].mean(), 3)})
+                rows.append(r)
+        ok = np.isfinite(edge)
+        nulls = []
+        for _ in range(RG_SHUFFLES):
+            e = _sgn(rng.permutation(lab), past) * ret
+            nulls.append(e[np.isfinite(e)].mean())
+        obs, nm, ns = edge[ok].mean(), float(np.mean(nulls)), float(np.std(nulls))
+        ctl.append({"tf": tf, "H": H, "obs_edge%": round(obs, 3), "null_mean%": round(nm, 3), "null_sd%": round(ns, 3),
+                    "z": round((obs - nm) / ns, 1) if ns > 0 else None, "oracle%": round(np.abs(ret).mean(), 3),
+                    "cost%": round(cost.mean(), 3), "oracle_net%": round(np.abs(ret).mean() - cost.mean(), 3)})
+    fence = "`" * 3
+    _emit("\n### Label regime: return ke depan per label (12 pair digabung = pooled, dan BTC saja). Label di close candle i, entry open i+1, exit close i+H, "
+          "sampel tiap H candle (tidak tumpang tindih). TREND_UP (ADX14 >= 25, +DI > -DI, close > EMA50), TREND_DOWN (kebalikannya), RANGE (ADX < 20), "
+          "NONE (sisanya). fwd% = rata-rata return mentah, abs% = rata-rata gerak absolut, edge% = rata-rata return searah label "
+          "(UP long, DOWN short, RANGE fade gerak H candle terakhir, NONE tidak trade), net% = edge% dikurangi biaya, t = t-stat (pair saling berkorelasi, "
+          "jadi t terlalu optimis), edge_IS / edge_OOS = paruh pertama / kedua\n"
+          + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
+    _emit("\n### Kontrol. obs_edge% = edge rata-rata semua sinyal UP/DOWN/RANGE; null = label diacak (30x), z = (obs - null) / sd; "
+          "oracle% = rata-rata |return| = batas atas kalau label tahu arah masa depan (bukti mesin bisa mendeteksi edge); oracle_net% = oracle dikurangi biaya\n"
+          + fence + "\n" + pd.DataFrame(ctl).to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -1293,6 +1430,10 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
+    if RG_RUN:
+        audit_tits(exchange)
+        run_regime(exchange)
+        return
     if TT_RUN:
         check_tt(exchange)
         if os.environ.get("CHECK_ONLY") == "1":
