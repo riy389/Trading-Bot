@@ -166,40 +166,70 @@ def find_setups(df):
 
     for i, row in df.iterrows():
         if i in buy_pools:
-            active_buy.append((i, *buy_pools[i]))
-        if i in sell_pools:
-            active_sell.append((i, *sell_pools[i]))
+            lo, hi = buy_pools[i]
+            active_buy.append({
+                "id": i, "low": lo, "high": hi,
+                "brokenTop": False, "brokenBtm": False
+            })
+            active_buy = active_buy[-2:]
 
-        # Sweep buy-side liquidity: high melewati zona lalu close kembali di bawah.
+        if i in sell_pools:
+            lo, hi = sell_pools[i]
+            active_sell.append({
+                "id": i, "low": lo, "high": hi,
+                "brokenTop": False, "brokenBtm": False
+            })
+            active_sell = active_sell[-2:]
+
+        # Buyside liquidity lifecycle.
+        for pool in active_buy:
+            if row["close"] > pool["high"]:
+                pool["brokenTop"] = True
+            if row["close"] > pool["low"]:
+                pool["brokenBtm"] = True
+
+        # Sellside liquidity lifecycle.
+        for pool in active_sell:
+            if row["close"] < pool["high"]:
+                pool["brokenTop"] = True
+            if row["close"] < pool["low"]:
+                pool["brokenBtm"] = True
+
+        # Hapus pool setelah kedua status broken terpenuhi.
+        active_buy = [
+            p for p in active_buy
+            if not (p["brokenTop"] and p["brokenBtm"])
+        ]
+        active_sell = [
+            p for p in active_sell
+            if not (p["brokenTop"] and p["brokenBtm"])
+        ]
+
         swept_high = next(
-            ((idx, lo, hi) for idx, lo, hi in reversed(active_buy)
-             if row["high"] > hi and row["close"] < hi),
+            (p for p in reversed(active_buy)
+             if row["high"] > p["high"] and row["close"] < p["high"]),
             None
         )
-        # Sweep sell-side liquidity: low melewati zona lalu close kembali di atas.
         swept_low = next(
-            ((idx, lo, hi) for idx, lo, hi in reversed(active_sell)
-             if row["low"] < lo and row["close"] > lo),
+            (p for p in reversed(active_sell)
+             if row["low"] < p["low"] and row["close"] > p["low"]),
             None
         )
 
         if swept_high:
             state = {"side": -1, "sweep_i": i, "extreme": row["high"]}
-            active_buy = [p for p in active_buy if p[0] != swept_high[0]]
+            active_buy = [p for p in active_buy if p["id"] != swept_high["id"]]
         elif swept_low:
             state = {"side": 1, "sweep_i": i, "extreme": row["low"]}
-            active_sell = [p for p in active_sell if p[0] != swept_low[0]]
+            active_sell = [p for p in active_sell if p["id"] != swept_low["id"]]
 
-        # MSS harus terjadi setelah sweep dan searah pembalikan.
         mss = mss_events.get(i)
-        if state and i > state["sweep_i"]:
-            if mss == state["side"]:
-                state["mss_i"] = i
+        if state and i > state["sweep_i"] and mss == state["side"]:
+            state["mss_i"] = i
 
         if not state or "mss_i" not in state or i <= state["mss_i"]:
             continue
 
-        # FVG: displacement pada candle sebelumnya dan gap tiga candle.
         if state["side"] == 1 and "fvg" not in state and i >= 2:
             if (df.iloc[i - 1]["displacement_up"]
                     and row["low"] > df.iloc[i - 2]["high"]):
@@ -248,7 +278,6 @@ def find_setups(df):
                 state = None
 
     return setups
-
 
 def backtest(df, setups, rr):
     trades = []
