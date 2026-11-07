@@ -281,7 +281,7 @@ def backtest(df, setups, rr):
     previous_day = None
 
     for i, row in df.iterrows():
-        session_day = (row["ts"] + pd.Timedelta(hours=7)).date()
+        session_day = row["ts"].date()
 
         if position is not None and previous_day is not None and session_day != previous_day:
             exit_price = previous_row["close"]
