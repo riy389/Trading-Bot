@@ -277,8 +277,29 @@ def backtest(df, setups, rr):
         setups_by_index.setdefault(setup[0], []).append(setup)
 
     position = None
+    previous_row = None
+    previous_day = None
 
     for i, row in df.iterrows():
+        session_day = (row["ts"] + pd.Timedelta(hours=7)).date()
+
+        if position is not None and previous_day is not None and session_day != previous_day:
+            exit_price = previous_row["close"]
+            result = (
+                position["side"] * (exit_price - position["entry"])
+                / position["risk"]
+            )
+            trades.append({
+                "entry_time": df.iloc[position["start"]]["ts"],
+                "exit_time": previous_row["ts"] + pd.Timedelta(minutes=15),
+                "side": "long" if position["side"] == 1 else "short",
+                "entry": position["entry"],
+                "sl": position["sl"],
+                "tp": position["tp"],
+                "result_R": result
+            })
+            position = None
+
         if position is not None and i > position["start"]:
             side = position["side"]
             result = None
@@ -338,6 +359,9 @@ def backtest(df, setups, rr):
                     "tp": entry + side * risk * rr,
                     "risk": risk
                 }
+
+        previous_row = row
+        previous_day = session_day
 
     return pd.DataFrame(trades)
 
