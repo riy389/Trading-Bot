@@ -272,38 +272,72 @@ def find_setups(df):
 
 def backtest(df, setups, rr):
     trades = []
-    for start, side, entry, sl, risk in setups:
-        tp = entry + side * risk * rr
-        result = None
-        exit_i = None
+    setups_by_index = {}
+    for setup in setups:
+        setups_by_index.setdefault(setup[0], []).append(setup)
 
-        for j in range(start + 1, len(df)):
-            row = df.iloc[j]
+    position = None
+
+    for i, row in df.iterrows():
+        if position is not None and i > position["start"]:
+            side = position["side"]
+            result = None
+
             if side == 1:
-                if row["low"] <= sl:
-                    result, exit_i = -1, j
-                    break
-                if row["high"] >= tp:
-                    result, exit_i = rr, j
-                    break
+                if row["low"] <= position["sl"]:
+                    result = -1
+                elif row["high"] >= position["tp"]:
+                    result = rr
             else:
-                if row["high"] >= sl:
-                    result, exit_i = -1, j
-                    break
-                if row["low"] <= tp:
-                    result, exit_i = rr, j
-                    break
+                if row["high"] >= position["sl"]:
+                    result = -1
+                elif row["low"] <= position["tp"]:
+                    result = rr
 
-        if result is not None:
-            trades.append({
-                "entry_time": df.iloc[start]["ts"],
-                "exit_time": df.iloc[exit_i]["ts"],
-                "side": "long" if side == 1 else "short",
-                "entry": entry,
-                "sl": sl,
-                "tp": tp,
-                "result_R": result
-            })
+            if result is not None:
+                trades.append({
+                    "entry_time": df.iloc[position["start"]]["ts"],
+                    "exit_time": row["ts"],
+                    "side": "long" if side == 1 else "short",
+                    "entry": position["entry"],
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "result_R": result
+                })
+                position = None
+
+        for start, side, entry, sl, risk in setups_by_index.get(i, []):
+            if position is None:
+                position = {
+                    "start": start,
+                    "side": side,
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": entry + side * risk * rr,
+                    "risk": risk
+                }
+            elif position["side"] != side:
+                result = (
+                    position["side"] * (entry - position["entry"])
+                    / position["risk"]
+                )
+                trades.append({
+                    "entry_time": df.iloc[position["start"]]["ts"],
+                    "exit_time": row["ts"],
+                    "side": "long" if position["side"] == 1 else "short",
+                    "entry": position["entry"],
+                    "sl": position["sl"],
+                    "tp": position["tp"],
+                    "result_R": result
+                })
+                position = {
+                    "start": start,
+                    "side": side,
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": entry + side * risk * rr,
+                    "risk": risk
+                }
 
     return pd.DataFrame(trades)
 
