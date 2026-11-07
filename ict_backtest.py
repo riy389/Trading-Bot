@@ -65,15 +65,14 @@ def prepare(df):
 
 
 def build_pools(df):
-    # ZigZag LuxAlgo: array terbaru berada di index 0, maksimum 50 pivot.
+    # ZigZag LuxAlgo: pivot terbaru di index 0, maksimum 50 pivot.
     zz_d, zz_x, zz_y = [], [], []
     buy_pools, sell_pools, mss_events = {}, {}, {}
     mss_dir = 0
 
     for i, row in df.iterrows():
         atr = row["atr"]
-        ph = row["pivot_high"]
-        pl = row["pivot_low"]
+        ph, pl = row["pivot_high"], row["pivot_low"]
 
         if np.isfinite(ph):
             direction = zz_d[0] if zz_d else 0
@@ -82,31 +81,31 @@ def build_pools(df):
                 zz_x.insert(0, i - 1)
                 zz_y.insert(0, float(ph))
             elif direction == 1 and ph > zz_y[0]:
-                zz_x[0] = i - 1
-                zz_y[0] = float(ph)
+                zz_x[0], zz_y[0] = i - 1, float(ph)
 
             del zz_d[50:]
             del zz_x[50:]
             del zz_y[50:]
 
-            # LuxAlgo liquidity clustering: pivot searah dalam jarak ATR / 2.5.
             if np.isfinite(atr):
-                tolerance = atr / 2.5
-                clustered = []
+                tol = atr / 2.5
+                count, st_b, st_p = 0, None, None
+                min_p, max_p = 10e6, 0.0
                 for d, x, y in zip(zz_d, zz_x, zz_y):
                     if d != 1:
                         continue
-                    if y > ph + tolerance:
+                    if y > ph + tol:
                         break
-                    if ph - tolerance < y < ph + tolerance:
-                        clustered.append(y)
-
-                if len(clustered) > 2:
-                    center = (min(clustered) + max(clustered)) / 2
-                    buy_pools[i] = (
-                        center - tolerance,
-                        center + tolerance
-                    )
+                    if ph - tol < y < ph + tol:
+                        count += 1
+                        st_b, st_p = x, y
+                        min_p, max_p = min(min_p, y), max(max_p, y)
+                if count > 2:
+                    center = (min_p + max_p) / 2
+                    buy_pools[i] = {
+                        "anchor": st_b, "line_price": st_p,
+                        "low": center - tol, "high": center + tol
+                    }
 
         if np.isfinite(pl):
             direction = zz_d[0] if zz_d else 0
@@ -115,41 +114,40 @@ def build_pools(df):
                 zz_x.insert(0, i - 1)
                 zz_y.insert(0, float(pl))
             elif direction == -1 and pl < zz_y[0]:
-                zz_x[0] = i - 1
-                zz_y[0] = float(pl)
+                zz_x[0], zz_y[0] = i - 1, float(pl)
 
             del zz_d[50:]
             del zz_x[50:]
             del zz_y[50:]
 
             if np.isfinite(atr):
-                tolerance = atr / 2.5
-                clustered = []
+                tol = atr / 2.5
+                count, st_b, st_p = 0, None, None
+                min_p, max_p = 10e6, 0.0
                 for d, x, y in zip(zz_d, zz_x, zz_y):
                     if d != -1:
                         continue
-                    if y < pl - tolerance:
+                    if y < pl - tol:
                         break
-                    if pl - tolerance < y < pl + tolerance:
-                        clustered.append(y)
+                    if pl - tol < y < pl + tol:
+                        count += 1
+                        st_b, st_p = x, y
+                        min_p, max_p = min(min_p, y), max(max_p, y)
+                if count > 2:
+                    center = (min_p + max_p) / 2
+                    sell_pools[i] = {
+                        "anchor": st_b, "line_price": st_p,
+                        "low": center - tol, "high": center + tol
+                    }
 
-                if len(clustered) > 2:
-                    center = (min(clustered) + max(clustered)) / 2
-                    sell_pools[i] = (
-                        center - tolerance,
-                        center + tolerance
-                    )
-
-        # MSS LuxAlgo: gunakan pivot ZigZag pada index 1 atau 2.
+        # MSS LuxAlgo.
         if len(zz_d) >= 2:
             i_h = 2 if len(zz_d) > 2 and zz_d[2] == 1 else 1
             i_l = 2 if len(zz_d) > 2 and zz_d[2] == -1 else 1
-
             if (len(zz_d) > i_h and zz_d[i_h] == 1
                     and row["close"] > zz_y[i_h] and mss_dir < 1):
                 mss_dir = 1
                 mss_events[i] = 1
-
             elif (len(zz_d) > i_l and zz_d[i_l] == -1
                     and row["close"] < zz_y[i_l] and mss_dir > -1):
                 mss_dir = -1
@@ -161,67 +159,68 @@ def build_pools(df):
 def find_setups(df):
     buy_pools, sell_pools, mss_events = build_pools(df)
     active_buy, active_sell = [], []
-    setups = []
-    state = None
+    setups, state = [], None
+    pool_seq = {"buy": 0, "sell": 0}
 
     for i, row in df.iterrows():
-        if i in buy_pools:
-            lo, hi = buy_pools[i]
-            active_buy.append({
-                "id": i, "low": lo, "high": hi,
-                "brokenTop": False, "brokenBtm": False
-            })
-            active_buy = active_buy[-2:]
+        for events, pools, side in (
+            (buy_pools, active_buy, "buy"),
+            (sell_pools, active_sell, "sell")
+        ):
+            event = events.get(i)
+            if event is None:
+                continue
 
-        if i in sell_pools:
-            lo, hi = sell_pools[i]
-            active_sell.append({
-                "id": i, "low": lo, "high": hi,
-                "brokenTop": False, "brokenBtm": False
-            })
-            active_sell = active_sell[-2:]
+            if pools and pools[0]["anchor"] == event["anchor"]:
+                pools[0].update(
+                    low=event["low"], high=event["high"],
+                    line_price=event["line_price"]
+                )
+            else:
+                pool_seq[side] += 1
+                pools.insert(0, {
+                    "id": pool_seq[side], "anchor": event["anchor"],
+                    "low": event["low"], "high": event["high"],
+                    "line_price": event["line_price"],
+                    "brokenTop": False, "brokenBtm": False, "broken": False
+                })
+                del pools[2:]
 
-        # Buyside liquidity lifecycle.
         for pool in active_buy:
-            if row["close"] > pool["high"]:
-                pool["brokenTop"] = True
-            if row["close"] > pool["low"]:
-                pool["brokenBtm"] = True
+            if not pool["broken"]:
+                if row["close"] > pool["high"]:
+                    pool["brokenTop"] = True
+                if row["close"] > pool["low"]:
+                    pool["brokenBtm"] = True
+                if pool["brokenBtm"] and pool["brokenTop"]:
+                    pool["broken"] = True
 
-        # Sellside liquidity lifecycle.
         for pool in active_sell:
-            if row["close"] < pool["high"]:
-                pool["brokenTop"] = True
-            if row["close"] < pool["low"]:
-                pool["brokenBtm"] = True
-
-        # Hapus pool setelah kedua status broken terpenuhi.
-        active_buy = [
-            p for p in active_buy
-            if not (p["brokenTop"] and p["brokenBtm"])
-        ]
-        active_sell = [
-            p for p in active_sell
-            if not (p["brokenTop"] and p["brokenBtm"])
-        ]
+            if not pool["broken"]:
+                if row["close"] < pool["high"]:
+                    pool["brokenTop"] = True
+                if row["close"] < pool["low"]:
+                    pool["brokenBtm"] = True
+                if pool["brokenBtm"] and pool["brokenTop"]:
+                    pool["broken"] = True
 
         swept_high = next(
             (p for p in reversed(active_buy)
-             if row["high"] > p["high"] and row["close"] < p["high"]),
-            None
+             if not p["broken"] and row["high"] > p["high"]
+             and row["close"] < p["high"]), None
         )
         swept_low = next(
             (p for p in reversed(active_sell)
-             if row["low"] < p["low"] and row["close"] > p["low"]),
-            None
+             if not p["broken"] and row["low"] < p["low"]
+             and row["close"] > p["low"]), None
         )
 
         if swept_high:
             state = {"side": -1, "sweep_i": i, "extreme": row["high"]}
-            active_buy = [p for p in active_buy if p["id"] != swept_high["id"]]
+            active_buy.remove(swept_high)
         elif swept_low:
             state = {"side": 1, "sweep_i": i, "extreme": row["low"]}
-            active_sell = [p for p in active_sell if p["id"] != swept_low["id"]]
+            active_sell.remove(swept_low)
 
         mss = mss_events.get(i)
         if state and i > state["sweep_i"] and mss == state["side"]:
@@ -233,26 +232,18 @@ def find_setups(df):
         if state["side"] == 1 and "fvg" not in state and i >= 2:
             if (df.iloc[i - 1]["displacement_up"]
                     and row["low"] > df.iloc[i - 2]["high"]):
-                state["fvg"] = (
-                    df.iloc[i - 2]["high"],
-                    row["low"]
-                )
+                state["fvg"] = (df.iloc[i - 2]["high"], row["low"])
                 state["fvg_i"] = i
-
         elif state["side"] == -1 and "fvg" not in state and i >= 2:
             if (df.iloc[i - 1]["displacement_down"]
                     and row["high"] < df.iloc[i - 2]["low"]):
-                state["fvg"] = (
-                    row["high"],
-                    df.iloc[i - 2]["low"]
-                )
+                state["fvg"] = (row["high"], df.iloc[i - 2]["low"])
                 state["fvg_i"] = i
 
         if "fvg" not in state or i <= state["fvg_i"]:
             continue
 
         bottom, top = state["fvg"]
-
         if state["side"] == 1:
             if row["low"] < bottom:
                 state = None
@@ -264,7 +255,6 @@ def find_setups(df):
                 if risk > 0:
                     setups.append((i, 1, entry, sl, risk))
                 state = None
-
         else:
             if row["high"] > top:
                 state = None
@@ -278,6 +268,7 @@ def find_setups(df):
                 state = None
 
     return setups
+
 
 def backtest(df, setups, rr):
     trades = []
