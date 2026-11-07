@@ -26,13 +26,15 @@ jobs:
           key: candles-${{ github.run_id }}
           restore-keys: candles-
 
-      - name: Run Ichimoku Backtest
-        run: python3 ichimoku_backtest.py
+      - name: Run ICT Backtest
+        run: python3 ict_backtest.py
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ichimoku-backtest-results
-          path: ichimoku_*
+          name: ict-backtest-results
+          path: |
+            ict_summary.csv
+            ict_trades.csv
           if-no-files-found: warn
