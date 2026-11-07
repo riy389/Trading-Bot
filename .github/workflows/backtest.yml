@@ -37,11 +37,11 @@ jobs:
           CHECK_ONLY: ${{ inputs.check_only && '1' || '0' }}
 
       - name: Evaluate results
-        if: ${{ !inputs.check_only }}
+        if: ${{ !inputs.check_only && hashFiles('results_summary.csv') != '' }}
         run: python3 evaluate.py
 
       - name: Upload results
-        if: always()
+        if: ${{ hashFiles('results_summary.csv') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: backtest-results
