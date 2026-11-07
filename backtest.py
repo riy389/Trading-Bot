@@ -1292,7 +1292,7 @@ def run_tits(exchange):
 
 
 # ---------- Tes label regime (market reader): return ke depan per label + audit trade The Tits ----------
-RG_RUN = True                # True: main() hanya menjalankan audit The Tits + tes label regime lalu selesai
+RG_RUN = False               # True: main() hanya menjalankan audit The Tits + tes label regime lalu selesai
 RG_COMBOS = [("1h", 4), ("1h", 24), ("4h", 1), ("4h", 6)]   # (timeframe label, horizon ke depan dalam candle); semua <= 24 jam
 RG_ADX_N, RG_ADX_TREND, RG_ADX_RANGE, RG_EMA_N = 14, 25, 20, 50
 RG_SHUFFLES = 30
@@ -1429,7 +1429,7 @@ def run_regime(exchange):
 
 
 # ---------- Uji mesin (known-answer): buy & hold, dua jalur hitung The Tits, strategi oracle ----------
-SAN_RUN = True               # True: main() hanya menjalankan uji mesin lalu selesai
+SAN_RUN = False              # True: main() hanya menjalankan uji mesin lalu selesai
 
 
 def run_sanity(exchange):
