@@ -1,0 +1,18 @@
+{
+  "max_open_trades": 1,
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "dry_run": true,
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "timeframe": "4h",
+  "exchange": {
+    "name": "bitget",
+    "pair_whitelist": ["BTC/USDT:USDT"],
+    "ccxt_config": {},
+    "ccxt_async_config": {}
+  },
+  "pairlists": [{"method": "StaticPairList"}],
+  "entry_pricing": {"price_side": "same"},
+  "exit_pricing": {"price_side": "same"}
+}
