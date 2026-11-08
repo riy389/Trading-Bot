@@ -24,7 +24,9 @@ jobs:
 
       - name: Backtest UT Bot grid (3 TF x A4-A7 x 3 pairs)
         run: |
+          sudo chmod -R a+rwX user_data
           mkdir -p user_data/backtest_results/logs
+          chmod a+rwx user_data/backtest_results/logs
           for CLS in \
             UTBotA4_15m UTBotA5_15m UTBotA6_15m UTBotA7_15m \
             UTBotA4_1h  UTBotA5_1h  UTBotA6_1h  UTBotA7_1h  \
