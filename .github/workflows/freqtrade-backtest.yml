@@ -1,0 +1,39 @@
+name: Freqtrade Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    container:
+      image: freqtradeorg/freqtrade:stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download data (5 years, 4h, BTC futures)
+        run: |
+          freqtrade download-data \
+            --config user_data/config_freqtrade.json \
+            --pairs BTC/USDT:USDT \
+            --trading-mode futures \
+            --timeframes 4h \
+            --timerange 20210101- \
+            --userdir user_data
+
+      - name: Check downloaded range
+        run: |
+          freqtrade list-data --userdir user_data --trading-mode futures >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Backtest UT Bot A4-A7
+        run: |
+          for CLS in UTBotA4 UTBotA5 UTBotA6 UTBotA7; do
+            echo "## $CLS" >> "$GITHUB_STEP_SUMMARY"
+            freqtrade backtesting \
+              --config user_data/config_freqtrade.json \
+              --strategy "$CLS" \
+              --strategy-path user_data/strategies \
+              --timerange 20210101- \
+              --fee 0.0006 \
+              --userdir user_data >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          done
