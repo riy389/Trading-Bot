@@ -1,6 +1,8 @@
 # UT Bot Alerts port — Pine v4 logic (key=a, ATR period=c, Heikin Ashi h=false)
-# Filter: EMA200(4h) searah sinyal (varian trail_ema4h dari checkpoint 31 Okt)
+# Filter: EMA200 self-timeframe (ikut TF entry masing-masing, bukan dipaku 4h)
 # Exit: garis trailing stop UT sendiri (tanpa TP tetap, tanpa BEP/lock)
+# Broaden: 3 TF (15m/1h/4h) x A(4,5,6,7) = 12 class, dijalankan terhadap
+# pair_whitelist BTC/ETH/SOL sekaligus lewat config.
 # Catatan: Freqtrade proses exit lalu entry per-candle terpisah (bukan reverse
 # instan satu candle seperti Pine stop-and-reverse). Efeknya hasil bisa geser
 # tipis vs mesin lama (backtest.py) — dicatat untuk pembacaan hasil nanti.
@@ -44,10 +46,9 @@ def _ut_bot(df: DataFrame, a: float, c: int) -> DataFrame:
     return df
 
 
-class UTBotA4(IStrategy):
-    timeframe = "4h"
+class _UTBotBase(IStrategy):
     can_short = True
-    UT_A = 4
+    UT_A = 6
     UT_C = 10
     minimal_roi = {"0": 100}
     stoploss = -0.99  # exit dikendalikan logic UT, bukan stoploss tetap
@@ -70,13 +71,64 @@ class UTBotA4(IStrategy):
         return df
 
 
-class UTBotA5(UTBotA4):
+# ---- 15m ----
+class UTBotA4_15m(_UTBotBase):
+    timeframe = "15m"
+    UT_A = 4
+
+
+class UTBotA5_15m(_UTBotBase):
+    timeframe = "15m"
     UT_A = 5
 
 
-class UTBotA6(UTBotA4):
+class UTBotA6_15m(_UTBotBase):
+    timeframe = "15m"
     UT_A = 6
 
 
-class UTBotA7(UTBotA4):
+class UTBotA7_15m(_UTBotBase):
+    timeframe = "15m"
+    UT_A = 7
+
+
+# ---- 1h ----
+class UTBotA4_1h(_UTBotBase):
+    timeframe = "1h"
+    UT_A = 4
+
+
+class UTBotA5_1h(_UTBotBase):
+    timeframe = "1h"
+    UT_A = 5
+
+
+class UTBotA6_1h(_UTBotBase):
+    timeframe = "1h"
+    UT_A = 6
+
+
+class UTBotA7_1h(_UTBotBase):
+    timeframe = "1h"
+    UT_A = 7
+
+
+# ---- 4h ----
+class UTBotA4_4h(_UTBotBase):
+    timeframe = "4h"
+    UT_A = 4
+
+
+class UTBotA5_4h(_UTBotBase):
+    timeframe = "4h"
+    UT_A = 5
+
+
+class UTBotA6_4h(_UTBotBase):
+    timeframe = "4h"
+    UT_A = 6
+
+
+class UTBotA7_4h(_UTBotBase):
+    timeframe = "4h"
     UT_A = 7

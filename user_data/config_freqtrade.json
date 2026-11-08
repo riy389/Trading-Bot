@@ -8,7 +8,11 @@
   "timeframe": "4h",
   "exchange": {
     "name": "bitget",
-    "pair_whitelist": ["BTC/USDT:USDT"],
+    "pair_whitelist": [
+      "BTC/USDT:USDT",
+      "ETH/USDT:USDT",
+      "SOL/USDT:USDT"
+    ],
     "ccxt_config": {},
     "ccxt_async_config": {}
   },

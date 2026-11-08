@@ -9,30 +9,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download data (5 years, 4h, BTC futures)
+      - name: Download data (5 years, 15m/1h/4h, BTC/ETH/SOL futures)
         run: |
           docker run --rm -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
             -w /freqtrade/user_data_mount \
             freqtradeorg/freqtrade:stable \
             download-data \
               --config user_data/config_freqtrade.json \
-              --pairs BTC/USDT:USDT \
+              --pairs BTC/USDT:USDT ETH/USDT:USDT SOL/USDT:USDT \
               --trading-mode futures \
-              --timeframes 4h \
+              --timeframes 15m 1h 4h \
               --timerange 20210101- \
               --userdir user_data
 
-      - name: Check downloaded range
+      - name: Backtest UT Bot grid (3 TF x A4-A7 x 3 pairs)
         run: |
-          docker run --rm -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
-            -w /freqtrade/user_data_mount \
-            freqtradeorg/freqtrade:stable \
-            list-data --userdir user_data --trading-mode futures >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Backtest UT Bot A4-A7
-        run: |
-          for CLS in UTBotA4 UTBotA5 UTBotA6 UTBotA7; do
-            echo "## $CLS" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p user_data/backtest_results/logs
+          for CLS in \
+            UTBotA4_15m UTBotA5_15m UTBotA6_15m UTBotA7_15m \
+            UTBotA4_1h  UTBotA5_1h  UTBotA6_1h  UTBotA7_1h  \
+            UTBotA4_4h  UTBotA5_4h  UTBotA6_4h  UTBotA7_4h; do
             docker run --rm -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
               -w /freqtrade/user_data_mount \
               freqtradeorg/freqtrade:stable \
@@ -42,5 +38,17 @@ jobs:
                 --strategy-path user_data/strategies \
                 --timerange 20210101- \
                 --fee 0.0006 \
-                --userdir user_data >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+                --export trades \
+                --userdir user_data > "user_data/backtest_results/logs/$CLS.txt" 2>&1 || true
           done
+
+      - name: Fix file ownership
+        if: always()
+        run: sudo chown -R "$USER" user_data/backtest_results
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: user_data/backtest_results/
