@@ -1,0 +1,106 @@
+[1mdiff --git a/ict_backtest.py b/ict_backtest.py[m
+[1mindex 30f1832..b7b3a6d 100644[m
+[1m--- a/ict_backtest.py[m
+[1m+++ b/ict_backtest.py[m
+[36m@@ -272,38 +272,72 @@[m [mdef find_setups(df):[m
+ [m
+ def backtest(df, setups, rr):[m
+     trades = [][m
+[31m-    for start, side, entry, sl, risk in setups:[m
+[31m-        tp = entry + side * risk * rr[m
+[31m-        result = None[m
+[31m-        exit_i = None[m
+[32m+[m[32m    setups_by_index = {}[m
+[32m+[m[32m    for setup in setups:[m
+[32m+[m[32m        setups_by_index.setdefault(setup[0], []).append(setup)[m
+[32m+[m
+[32m+[m[32m    position = None[m
+[32m+[m
+[32m+[m[32m    for i, row in df.iterrows():[m
+[32m+[m[32m        if position is not None and i > position["start"]:[m
+[32m+[m[32m            side = position["side"][m
+[32m+[m[32m            result = None[m
+ [m
+[31m-        for j in range(start + 1, len(df)):[m
+[31m-            row = df.iloc[j][m
+             if side == 1:[m
+[31m-                if row["low"] <= sl:[m
+[31m-                    result, exit_i = -1, j[m
+[31m-                    break[m
+[31m-                if row["high"] >= tp:[m
+[31m-                    result, exit_i = rr, j[m
+[31m-                    break[m
+[32m+[m[32m                if row["low"] <= position["sl"]:[m
+[32m+[m[32m                    result = -1[m
+[32m+[m[32m                elif row["high"] >= position["tp"]:[m
+[32m+[m[32m                    result = rr[m
+             else:[m
+[31m-                if row["high"] >= sl:[m
+[31m-                    result, exit_i = -1, j[m
+[31m-                    break[m
+[31m-                if row["low"] <= tp:[m
+[31m-                    result, exit_i = rr, j[m
+[31m-                    break[m
+[31m-[m
+[31m-        if result is not None:[m
+[31m-            trades.append({[m
+[31m-                "entry_time": df.iloc[start]["ts"],[m
+[31m-                "exit_time": df.iloc[exit_i]["ts"],[m
+[31m-                "side": "long" if side == 1 else "short",[m
+[31m-                "entry": entry,[m
+[31m-                "sl": sl,[m
+[31m-                "tp": tp,[m
+[31m-                "result_R": result[m
+[31m-            })[m
+[32m+[m[32m                if row["high"] >= position["sl"]:[m
+[32m+[m[32m                    result = -1[m
+[32m+[m[32m                elif row["low"] <= position["tp"]:[m
+[32m+[m[32m                    result = rr[m
+[32m+[m
+[32m+[m[32m            if result is not None:[m
+[32m+[m[32m                trades.append({[m
+[32m+[m[32m                    "entry_time": df.iloc[position["start"]]["ts"],[m
+[32m+[m[32m                    "exit_time": row["ts"],[m
+[32m+[m[32m                    "side": "long" if side == 1 else "short",[m
+[32m+[m[32m                    "entry": position["entry"],[m
+[32m+[m[32m                    "sl": position["sl"],[m
+[32m+[m[32m                    "tp": position["tp"],[m
+[32m+[m[32m                    "result_R": result[m
+[32m+[m[32m                })[m
+[32m+[m[32m                position = None[m
+[32m+[m
+[32m+[m[32m        for start, side, entry, sl, risk in setups_by_index.get(i, []):[m
+[32m+[m[32m            if position is None:[m
+[32m+[m[32m                position = {[m
+[32m+[m[32m                    "start": start,[m
+[32m+[m[32m                    "side": side,[m
+[32m+[m[32m                    "entry": entry,[m
+[32m+[m[32m                    "sl": sl,[m
+[32m+[m[32m                    "tp": entry + side * risk * rr,[m
+[32m+[m[32m                    "risk": risk[m
+[32m+[m[32m                }[m
+[32m+[m[32m            elif position["side"] != side:[m
+[32m+[m[32m                result = ([m
+[32m+[m[32m                    position["side"] * (entry - position["entry"])[m
+[32m+[m[32m                    / position["risk"][m
+[32m+[m[32m                )[m
+[32m+[m[32m                trades.append({[m
+[32m+[m[32m                    "entry_time": df.iloc[position["start"]]["ts"],[m
+[32m+[m[32m                    "exit_time": row["ts"],[m
+[32m+[m[32m                    "side": "long" if position["side"] == 1 else "short",[m
+[32m+[m[32m                    "entry": position["entry"],[m
+[32m+[m[32m                    "sl": position["sl"],[m
+[32m+[m[32m                    "tp": position["tp"],[m
+[32m+[m[32m                    "result_R": result[m
+[32m+[m[32m                })[m
+[32m+[m[32m                position = {[m
+[32m+[m[32m                    "start": start,[m
+[32m+[m[32m                    "side": side,[m
+[32m+[m[32m                    "entry": entry,[m
+[32m+[m[32m                    "sl": sl,[m
+[32m+[m[32m                    "tp": entry + side * risk * rr,[m
+[32m+[m[32m                    "risk": risk[m
+[32m+[m[32m                }[m
+ [m
+     return pd.DataFrame(trades)[m
+ [m

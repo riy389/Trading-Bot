@@ -1,0 +1,59 @@
+name: Freqtrade Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download data (5 years, 1h/4h, BTC/ETH/SOL futures)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
+            -w /freqtrade/user_data_mount \
+            freqtradeorg/freqtrade:stable \
+            download-data \
+              --config user_data/config_freqtrade.json \
+              --pairs BTC/USDT:USDT ETH/USDT:USDT SOL/USDT:USDT \
+              --trading-mode futures \
+              --timeframes 1h 4h \
+              --timerange 20210101- \
+              --userdir user_data
+
+      - name: Backtest UT Bot per pair (2 TF x A4-A7 x 3 pairs = 24 run)
+        run: |
+          sudo chmod -R a+rwX user_data
+          mkdir -p user_data/backtest_results/logs
+          chmod a+rwx user_data/backtest_results/logs
+          for PAIR in BTC/USDT:USDT ETH/USDT:USDT SOL/USDT:USDT; do
+            SYM="${PAIR%%/*}"
+            for CLS in \
+              UTBotA4_1h UTBotA5_1h UTBotA6_1h UTBotA7_1h \
+              UTBotA4_4h UTBotA5_4h UTBotA6_4h UTBotA7_4h; do
+              docker run --rm -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
+                -w /freqtrade/user_data_mount \
+                freqtradeorg/freqtrade:stable \
+                backtesting \
+                  --config user_data/config_freqtrade.json \
+                  --strategy "$CLS" \
+                  --strategy-path user_data/strategies \
+                  --pairs "$PAIR" \
+                  --timerange 20210101- \
+                  --fee 0.0006 \
+                  --export trades \
+                  --userdir user_data > "user_data/backtest_results/logs/${CLS}_${SYM}.txt" 2>&1 || true
+            done
+          done
+
+      - name: Fix file ownership
+        if: always()
+        run: sudo chown -R "$USER" user_data/backtest_results
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: user_data/backtest_results/
