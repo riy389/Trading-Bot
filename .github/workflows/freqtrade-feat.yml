@@ -1,0 +1,64 @@
+name: Freqtrade Signal Features
+
+on:
+  workflow_dispatch:
+
+jobs:
+  feat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tf: 1h
+            range: "20210101-"
+          - tf: 15m
+            range: "20210101-"
+          - tf: 5m
+            range: "20250101-"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download data
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
+            -w /freqtrade/user_data_mount \
+            freqtradeorg/freqtrade:stable \
+            download-data \
+              --config user_data/config_freqtrade.json \
+              --pairs BTC/USDT:USDT ETH/USDT:USDT SOL/USDT:USDT \
+              --trading-mode futures \
+              --timeframes ${{ matrix.tf }} \
+              --timerange ${{ matrix.range }} \
+              --userdir user_data
+
+      - name: Dump signal features
+        run: |
+          sudo chmod -R a+rwX user_data
+          R=user_data/backtest_results
+          mkdir -p $R
+          chmod a+rwx $R
+          for AC in "2 1" "3 10" "5 10" "7 10"; do
+            set -- $AC
+            TAG="${{ matrix.tf }}_A$1_C$2"
+            docker run --rm -e UT_A="$1" -e UT_C="$2" -e UT_DUMP="$R/feat_$TAG.csv" \
+              -v "${{ github.workspace }}:/freqtrade/user_data_mount" \
+              -w /freqtrade/user_data_mount \
+              freqtradeorg/freqtrade:stable \
+              backtesting \
+                --config user_data/config_freqtrade.json \
+                --strategy UTBotFeat \
+                --strategy-path user_data/strategies \
+                --timeframe ${{ matrix.tf }} \
+                --timerange ${{ matrix.range }} \
+                --export none \
+                --userdir user_data > "$R/log_$TAG.txt" 2>&1 || true
+          done
+          gzip -f $R/feat_*.csv || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feat-${{ matrix.tf }}
+          path: user_data/backtest_results/

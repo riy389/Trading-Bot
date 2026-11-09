@@ -132,3 +132,76 @@ class UTBotA6_4h(_UTBotBase):
 class UTBotA7_4h(_UTBotBase):
     timeframe = "4h"
     UT_A = 7
+
+
+# ---- Analisis fitur sinyal UT Bot (tanpa filter). Dump CSV lewat env UT_DUMP ----
+import os
+import talib.abstract as ta
+
+
+class UTBotFeat(_UTBotBase):
+    timeframe = "1h"
+    UT_A = float(os.environ.get("UT_A", 5))
+    UT_C = int(os.environ.get("UT_C", 10))
+    PAIRS = [(3, 8), (5, 13), (10, 20), (20, 50)]
+    FEE = 0.0012  # 0.06% x 2 sisi
+
+    def populate_indicators(self, df: DataFrame, metadata: dict) -> DataFrame:
+        df = super().populate_indicators(df, metadata)
+        h, l, c, o = df["high"], df["low"], df["close"], df["open"]
+        for p in (3, 5, 8, 10, 13, 20, 50):
+            df[f"ema{p}"] = c.ewm(span=p, adjust=False).mean()
+        atr = ta.ATR(df, timeperiod=14)
+        flip = (df["ut_buy"] | df["ut_sell"]).values
+        d = np.where(df["ut_buy"].values, 1, -1)
+        n = len(df)
+
+        f = pd.DataFrame(index=df.index)
+        f["side"] = d
+        f["adx"] = ta.ADX(df, timeperiod=14)
+        f["rsi"] = ta.RSI(df, timeperiod=14)
+        f["atr_pct"] = atr / c * 100
+        f["body_atr"] = (c - o) * d / atr
+        f["rng10_atr"] = (h.rolling(10).max() - l.rolling(10).min()) / atr
+        f["vol_ratio"] = df["volume"] / df["volume"].rolling(20).mean()
+        tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        f["chop"] = 100 * np.log10(tr.rolling(14).sum() / (h.rolling(14).max() - l.rolling(14).min())) / np.log10(14)
+        f["d50"] = (c - df["ema50"]) * d / atr
+        f["d200"] = (c - df["ema200"]) * d / atr
+        for a, b in self.PAIRS:
+            f[f"e{a}_{b}"] = (df[f"ema{a}"] - df[f"ema{b}"]) * d / atr
+        f["hour"] = df["date"].dt.hour
+
+        # label (pakai data ke depan, hanya untuk analisis, bukan untuk trading)
+        ev = {p: df[f"ema{p}"].values for p in (3, 5, 8, 10, 13, 20, 50)}
+        cl = c.values
+        idx = np.flatnonzero(flip)
+        end = np.append(idx[1:], n - 1)
+        nan = lambda: np.full(n, np.nan)
+        raw, leg, prev = nan(), nan(), nan()
+        lag = {k: nan() for k in self.PAIRS}
+        ret = {k: nan() for k in self.PAIRS}
+        for m, (i, j) in enumerate(zip(idx, end)):
+            s = d[i]
+            raw[i] = s * (cl[j] / cl[i] - 1) - self.FEE
+            leg[i] = j - i
+            if m:
+                prev[i] = i - idx[m - 1]
+            for a, b in self.PAIRS:
+                ok = (ev[a][i:j] - ev[b][i:j]) * s > 0
+                if ok.any():
+                    k = i + int(ok.argmax())
+                    lag[(a, b)][i] = k - i
+                    ret[(a, b)][i] = s * (cl[j] / cl[k] - 1) - self.FEE
+        f["prev_leg"], f["leg"], f["ret_raw"] = prev, leg, raw
+        for a, b in self.PAIRS:
+            f[f"c{a}_{b}_lag"] = lag[(a, b)]
+            f[f"c{a}_{b}_ret"] = ret[(a, b)]
+
+        out = os.environ.get("UT_DUMP")
+        if out:
+            sig = f[flip].round(4)
+            sig.insert(0, "pair", metadata["pair"])
+            sig.insert(0, "date", df.loc[flip, "date"])
+            sig.to_csv(out, mode="a", header=not os.path.exists(out), index=False)
+        return df
