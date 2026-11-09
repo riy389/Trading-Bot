@@ -37,7 +37,6 @@ jobs:
           sudo chmod -R a+rwX user_data
           R=user_data/backtest_results
           mkdir -p $R
-          chmod a+rwx $R
           for AC in "2 10" "3 10" "5 10" "7 10"; do
             set -- $AC
             TAG="${{ matrix.tf }}_A$1_C$2"
