@@ -1,0 +1,45 @@
+name: Run UT_SWING
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: "Cek sinyal saja (tanpa backtest)"
+        type: boolean
+        default: false
+
+jobs:
+  utswing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ccxt pandas numpy
+
+      - name: Cache candles
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+
+      - name: Run UT_SWING
+        run: python3 utswing.py
+        env:
+          CHECK_ONLY: ${{ inputs.check_only && '1' || '0' }}
+
+      - name: Upload results
+        if: ${{ hashFiles('trades_utswing.csv') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: utswing-results
+          path: trades_utswing.csv
+          if-no-files-found: warn
