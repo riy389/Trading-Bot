@@ -36,7 +36,7 @@ def run(ex):
     ps = et.pivot_state(h, l, bt._rsi(c, 14), et.PIV_N)
     prev = lambda a: np.r_[np.nan, a[:-1]]
     stop_b, stop_s = prev(ps["sl"]) - SL_BUF * prev(atr), prev(ps["sh"]) + SL_BUF * prev(atr)
-    fin = X.notna().all(axis=1).to_numpy()
+    fin = X.notna().all(axis=1).to_numpy().copy()
     fin[:et.WARM], fin[n - N_HOLD:] = False, False
     side = rules(X)
     side[~fin] = 0
