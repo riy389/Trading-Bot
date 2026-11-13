@@ -42,7 +42,8 @@ def run(ex):
     side[~fin] = 0
     h1, di = X["h1_ema20_dist"].to_numpy(), X["di_diff"].to_numpy()
     okd = np.where((h1 > 0) & (di > 0), 1, np.where((h1 < 0) & (di < 0), -1, 0))
-    modes = {"aturan": side, "aturan+arah": np.where(side == okd, side, 0)}
+    okb = np.where(X["h1_bb_pctb"].to_numpy() > 0.5, 1, -1)
+    modes = {"aturan": side, "aturan+arah": np.where(side == okd, side, 0), "aturan+bb": np.where(side == okb, side, 0)}
 
     def one(t, s, var):
         e = o[t]
