@@ -45,8 +45,10 @@ def run(ex):
             t, r, _, hold = (np.array(z) for z in zip(*tr))
             r = r.astype(float)
             net = r - K.FEE
+            t0 = (t - hold).astype(int)
+            mfe = np.array([(h[a:b].max() / o[a] - 1) if sig[a - 1] > 0 else (1 - l[a:b].min() / o[a]) for a, b in zip(t0, t)])
             rows.append({"TF": tf, "aturan": nm, "trade": len(tr), "per_bulan": round(len(tr) / months, 1), "jam_rata": round(hold.mean() * HOURS[tf], 1),
-                         "hit%": round((net > 0).mean() * 100, 1), "kotor_total%": round(r.sum() * 100, 1), "fee_total%": round(len(tr) * K.FEE * 100, 1),
+                         "hit%": round((net > 0).mean() * 100, 1), "MFE_rata%": round(mfe.mean() * 100, 2), "MFE>=2,7%": round((mfe >= 0.027).mean() * 100, 1), "kotor_total%": round(r.sum() * 100, 1), "fee_total%": round(len(tr) * K.FEE * 100, 1),
                          "bersih_total%": round(net.sum() * 100, 1), "kotor%/trade": round(r.mean() * 100, 3), "paruh1%": round(net[early[t]].sum() * 100, 1),
                          "paruh2%": round(net[~early[t]].sum() * 100, 1), "terburuk%": round(net.min() * 100, 1), "terbaik%": round(net.max() * 100, 1)})
             for y in np.unique(year[t]):
