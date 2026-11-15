@@ -35,7 +35,7 @@ PAIRS = [
     "LTC/USDT:USDT", "DOT/USDT:USDT", "TRX/USDT:USDT",
 ]  # Bitget perpetual swap, 12 pair
 TIMEFRAMES = ["15m", "1h", "4h"]   # 5m dibuang (netR negatif di semua A)
-DAYS_BACK_TF = {"5m": 365 * 2, "15m": 365 * 2, "1h": 365 * 5, "4h": 365 * 5}   # hari data per timeframe
+DAYS_BACK_TF = {"5m": 365 * 5, "15m": 365 * 5, "1h": 365 * 5, "4h": 365 * 5}   # hari data per timeframe
 TAKER_FEE = 0.0006           # 0.06% per sisi (Bitget futures taker)
 ROUND_TRIP_FEE = TAKER_FEE * 2
 SLIPPAGE = 0.0005            # 0.05% per sisi
@@ -133,7 +133,7 @@ def fetch_ohlcv(exchange, symbol, timeframe, days_back, since_ms=None, until_ms=
             since = last_ts + 1
         print(f"    ...{len(all_candles)} candle terkumpul (sampai {candles[-1][0]})")
         time.sleep(exchange.rateLimit / 1000)
-        if len(all_candles) > 300000:  # safety cap
+        if len(all_candles) > 700000:  # safety cap
             break
 
     if not all_candles:
