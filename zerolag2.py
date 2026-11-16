@@ -14,6 +14,7 @@ import eventtree2 as e2
 from zerolag import band, trend, stats
 
 ORDER = ("5m", "15m", "1h", "4h", "1d")
+FILT = ("5m", "15m", "1h", "4h")  # TF aturan MTF: 4H bias, 1H setup, 15M konfirmasi, 5M trigger
 
 
 def load_all(ex):
@@ -69,13 +70,15 @@ def trades(e, tg):
 def run(ex):
     D = load_all(ex)
     rows, yrs = [], []
-    for k, tf in enumerate(ORDER):
-        e, hi = D[tf], ORDER[k + 1:]
-        ok = (e["tr"] != 0)
-        for h in hi:
-            ok &= align(e, D[h]) == e["tr"]
-        modes = [("sendiri", "none")] + ([(f"MTF-A +{'/'.join(hi)}", "A"), (f"MTF-B +{'/'.join(hi)}", "B")] if hi else [])
-        for nm, md in modes:
+    for tf in ORDER:
+        e = D[tf]
+        above = FILT[FILT.index(tf) + 1:] if tf in FILT else ()
+        sets = [above[-k:] for k in range(1, len(above) + 1)]
+        modes = [("sendiri", "none", ())] + [(f"MTF-{m} +{'/'.join(st)}", m, st) for st in sets for m in ("A", "B")]
+        for nm, md, st in modes:
+            ok = e["tr"] != 0
+            for h in st:
+                ok = ok & (align(e, D[h]) == e["tr"])
             r, y = stats(trades(e, target(e["tr"], ok, md)), e["yr"], tf, nm, e["months"])
             if r:
                 rows.append(r)
