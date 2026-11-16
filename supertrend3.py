@@ -10,6 +10,9 @@ SUPERTREND3: 3 Supertrend (ATR period-multiplier 10-1, 11-2, 12-3), BTC. Spesifi
 - Varian exit: flip = SL swing + keluar saat salah satu Supertrend balik arah (di open candle berikutnya).
   lock1R = SL swing; setelah +1R (high/low 5m sebelumnya) SL dikunci di +1R, lalu trailing garis Supertrend 10-1
   (candle TF yang sudah close) kalau lebih menguntungkan. Sinyal berlawanan penuh menutup posisi (reverse).
+- lock1000 = SL swing; setelah harga +LOCK_PCT (1,35% = sekitar 1000 poin di BTC 74.000) SL dikunci di +LOCK_PCT, lalu trailing garis ST 10-1
+  kalau lebih menguntungkan (turun balik ke level itu = langsung keluar di +1000 poin). _sl = candle 5m yang kena SL dan level kunci
+  sekaligus dianggap SL duluan, _tp = dianggap level kunci (TP) duluan. Dua-duanya dilaporkan supaya terlihat rentangnya.
 - Filter volatilitas (varian _vol): entry hanya kalau ATR(14)% >= persentil 70 dari 500 candle sebelumnya DAN lebar Bollinger(20,2)
   >= rata-rata 100 candle sebelumnya. Dikunci sebelum lihat hasil.
 - Semua exit dicek di candle 5m. SL dan level kunci di candle 5m yang sama -> SL duluan (dihitung di tie5m).
@@ -28,6 +31,7 @@ ENTRY_TFS = ["1h", "15m"]
 ST_PARAMS = [(10, 1.0), (11, 2.0), (12, 3.0)]   # (periode ATR, multiplier); yang pertama dipakai untuk trailing
 SWING_N = 5                                      # dikunci sebelum lihat hasil
 LOCK_R = 1.0
+LOCK_PCT = 0.0135                                # kunci/TP 1000 poin sebagai % harga entry (poin tetap melenceng saat BTC 16-30 ribu)
 ATR_N, ATR_LOOK, ATR_PCTL = 14, 500, 0.70
 BB_N, BB_LOOK = 20, 100
 SWEEP_BARS = 288                                 # sapuan = SL kena lalu harga balik ke entry dalam 24 jam (candle 5m)
@@ -87,7 +91,7 @@ def random_signals(S, n, rng, vol):
     return [(int(S["js"][i]), 1 if rng.random() < 0.5 else -1, int(i)) for i in idx]
 
 
-def simulate(S, sigs, mode, use_state):
+def simulate(S, sigs, mode, use_state, tp_first=False):
     o, h, l, c = S["o"], S["h"], S["l"], S["c"]
     newbar, state5, line5 = S["newbar"], S["state5"], S["line5"]
     n5 = len(o)
@@ -100,27 +104,31 @@ def simulate(S, sigs, mode, use_state):
         nl = sign * (e - sw)
         if not (sw == sw and nl > 0 and nl / e >= bt.MIN_SL_PCT):
             continue
+        ld = LOCK_PCT * e if mode == "lockp" else LOCK_R * nl      # jarak harga untuk kunci
         locked, mfe, ex = False, 0.0, None
         for j in range(js, n5):
             if use_state and j > js and newbar[j]:
                 s = state5[j]
-                if (mode == "flip" and s != sign) or (mode == "lock" and s == -sign):
+                if (mode == "flip" and s != sign) or (mode != "flip" and s == -sign):
                     ex = (j, o[j], "reverse" if s == -sign else "flip", j)
                     break
             lvl, why = sw, "stop_loss"
             if locked:
-                lvl, why = e + sign * nl * LOCK_R, "lock_stop"
+                lvl, why = e + sign * ld, "lock_stop"
                 tl = line5[j]
                 if tl == tl and sign * (tl - lvl) > 0:
                     lvl, why = tl, "trail_win"
             ext = h[j] if sign == 1 else l[j]
             if (l[j] <= lvl) if sign == 1 else (h[j] >= lvl):
-                if mode == "lock" and not locked and sign * (ext - e) >= LOCK_R * nl:
-                    ties += 1
-                ex = (j, min(o[j], lvl) if sign == 1 else max(o[j], lvl), why, j + 1)
+                tie = mode != "flip" and not locked and sign * (ext - e) >= ld
+                ties += tie
+                if tie and tp_first:
+                    ex = (j, e + sign * ld, "lock_stop", j + 1)     # level kunci/TP tersentuh duluan, lalu balik ke level itu
+                else:
+                    ex = (j, min(o[j], lvl) if sign == 1 else max(o[j], lvl), why, j + 1)
                 break
             mfe = max(mfe, sign * (ext - e) / nl)
-            if mode == "lock" and mfe >= LOCK_R:
+            if mode != "flip" and mfe >= ld / nl:
                 locked = True
         if ex is None:
             ex = (n5 - 1, c[-1], "end_data", n5)
@@ -165,13 +173,14 @@ def run(d5, dfs):
         S = prep(df, tf, t5, base)
         s_all, s_vol = st_signals(S, False), st_signals(S, True)
         rng = np.random.default_rng(1)
-        sets = [("ST", s_all, ("flip", "lock"), True), ("ST_vol", s_vol, ("flip", "lock"), True),
-                ("random", random_signals(S, len(s_all), rng, False), ("lock",), False),
-                ("random_vol", random_signals(S, len(s_vol), rng, True), ("lock",), False)]
-        for sname, sigs, modes, use_state in sets:
-            for mode in modes:
-                name = f"{sname}_{'flip' if mode == 'flip' else 'lock1R'}"
-                trades, ties = simulate(S, sigs, mode, use_state)
+        V = {"flip": ("flip", False), "lock1R": ("lock", False), "lock1000_sl": ("lockp", False), "lock1000_tp": ("lockp", True)}
+        sets = [("ST", s_all, list(V), True), ("ST_vol", s_vol, list(V), True),
+                ("random", random_signals(S, len(s_all), rng, False), list(V)[1:], False),
+                ("random_vol", random_signals(S, len(s_vol), rng, True), list(V)[1:], False)]
+        for sname, sigs, vnames, use_state in sets:
+            for vn in vnames:
+                name = f"{sname}_{vn}"
+                trades, ties = simulate(S, sigs, V[vn][0], use_state, V[vn][1])
                 for cname, cost in (("net", cost_net), ("gross", 0.0)):
                     r, costed = make_row(tf, name, trades, ties, len(sigs), cname, cost, split_ts, days)
                     rows.append(r)
@@ -181,11 +190,11 @@ def run(d5, dfs):
     pd.DataFrame(trade_rows).to_csv(OUTPUT_TRADES, index=False)
     fence = "`" * 3
     bt._emit("\n### SUPERTREND3 (10-1, 11-2, 12-3 searah), BTC, SL di swing terakhir (pivot " + f"{SWING_N}" + " kiri/kanan, tanpa buffer), long dan short. "
-             "flip = keluar saat salah satu ST balik arah. lock1R = SL dikunci di +1R lalu trailing garis ST 10-1. _vol = hanya saat ATR% >= persentil 70 "
+             "flip = keluar saat salah satu ST balik arah. lock1R = SL dikunci di +1R lalu trailing garis ST 10-1. lock1000 = sama tapi dikunci di +" + f"{LOCK_PCT * 100:.2f}" + "% (sekitar 1000 poin), _sl = tie SL duluan, _tp = tie TP duluan. _vol = hanya saat ATR% >= persentil 70 "
              "dan lebar Bollinger >= rata-rata. random = entry acak (jumlah = n_sig) dengan aturan SL dan kunci sama; random_vol = acak hanya di bar lolos filter. "
              f"net = biaya {cost_net * 100:.2f}%, gross = tanpa biaya. n_sig = sinyal, n = trade terisi. sweep% = % SL kena lalu harga balik ke entry dalam 24 jam. "
-             "tie5m = candle 5m yang kena SL dan +1R sekaligus (dianggap SL duluan). edge = PF IS dan OOS >= 1,2, netR > 0, n >= 30 per paruh\n"
-             + fence + "\n" + pd.DataFrame(rows).drop(columns=["A", "ATR", "pct_tp"], errors="ignore").to_string(index=False) + "\n" + fence)
+             "tie5m = candle 5m yang kena SL dan level kunci sekaligus. edge = PF IS dan OOS >= 1,2, netR > 0, n >= 30 per paruh\n"
+             + fence + "\n" + pd.DataFrame(rows).drop(columns=["A", "ATR", "pct_tp", "move%", "fee_R"], errors="ignore").to_string(index=False) + "\n" + fence)
 
 
 def main():
