@@ -1,0 +1,38 @@
+name: Run SUPERTREND3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  supertrend3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ccxt pandas numpy
+
+      - name: Cache candles
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+
+      - name: Run SUPERTREND3
+        run: python3 supertrend3.py
+
+      - name: Upload results
+        if: ${{ hashFiles('trades_supertrend3.csv') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: supertrend3-results
+          path: trades_supertrend3.csv
+          if-no-files-found: warn
