@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
-TRIPLE SUPERTREND (10-1, 11-2, 12-3), SEMUA TF + MTF.
-Aturan indikator: tunggu close menembus pita, entry/keluar di open bar berikutnya, tanpa TP.
-Entry: Konfluensi penuh (ketiga Supertrend searah).
-Exit Modes:
-  - Exit-A (Cepat)     : keluar jika salah satu Supertrend flip (pita sensitif 10-1).
-  - Exit-B (Tahan Tren): keluar hanya jika pita terluar 12-3 flip.
-  - Exit-C (Mayoritas) : keluar jika minimal 2 dari 3 Supertrend flip.
-MTF-A: masuk saat TF entry mencapai konfluensi penuh DAN semua TF filter di atasnya juga konfluensi searah;
-       keluar sesuai aturan Exit Mode TF entry.
-MTF-B: bertahan di posisi hanya selama TF entry memenuhi Exit Mode DAN semua TF filter di atasnya tetap konfluensi searah.
-Biaya fee 0,12% + slippage 0,10% per trade (ditangani oleh modul stats).
+TRIPLE SUPERTREND (10-1, 11-2, 12-3), SEMUA TF + MTF + TV DETAIL METRICS.
 """
 import numpy as np
 import pandas as pd
@@ -18,18 +8,18 @@ import pandas as pd
 import backtest as bt
 import eventtree2 as e2
 from zerolag import stats
+from tv_metrics import generate_tv_report
 
 ORDER = ("5m", "15m", "1h", "4h", "1d")
 FILT = ("5m", "15m", "1h", "4h")
 ST_PARAMS = (
-    (10, 1.0),  # ST1: cepat / sensitif
-    (11, 2.0),  # ST2: sedang / mayoritas
-    (12, 3.0),  # ST3: lambat / pita terluar
+    (10, 1.0),
+    (11, 2.0),
+    (12, 3.0),
 )
 
 
 def rma(series: np.ndarray, length: int) -> np.ndarray:
-    """Wilder's Smoothing (RMA) identik dengan ta.rma di TradingView."""
     out = np.full(len(series), np.nan, dtype=float)
     if len(series) < length:
         return out
@@ -41,7 +31,6 @@ def rma(series: np.ndarray, length: int) -> np.ndarray:
 
 
 def calc_supertrend(df: pd.DataFrame, atr_len: int, mult: float):
-    """Menghitung upperBand, lowerBand, dan arah trend (1 = uptrend, -1 = downtrend, 0 = warmup)."""
     h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float)
     c = df["close"].to_numpy(float)
@@ -79,21 +68,16 @@ def calc_supertrend(df: pd.DataFrame, atr_len: int, mult: float):
 
 
 def build_triple_signals(df: pd.DataFrame):
-    """Menghasilkan sinyal konfluensi penuh serta state bertahan untuk Exit Mode A, B, dan C."""
     sts = [calc_supertrend(df, length, mult) for length, mult in ST_PARAMS]
-    ub1, lb1, tr1 = sts[0]  # 10-1
-    ub2, lb2, tr2 = sts[1]  # 11-2
-    ub3, lb3, tr3 = sts[2]  # 12-3
+    ub1, lb1, tr1 = sts[0]
+    ub2, lb2, tr2 = sts[1]
+    ub3, lb3, tr3 = sts[2]
 
-    # Konfluensi penuh: ketiga Supertrend harus +1 (Long) atau -1 (Short)
     conf = np.where((tr1 == 1) & (tr2 == 1) & (tr3 == 1), 1,
            np.where((tr1 == -1) & (tr2 == -1) & (tr3 == -1), -1, 0))
 
-    # Status bertahan (hold) per Exit Mode sebelum filter MTF:
-    # Mode A (cepat): bertahan hanya selama ketiga ST masih searah (satu flip -> 0)
     hold_A = conf.copy()
 
-    # Mode B (tahan tren): entry saat konfluensi, bertahan selama 12-3 belum berbalik
     hold_B = np.zeros(len(conf), dtype=int)
     cur = 0
     for i in range(1, len(conf)):
@@ -105,8 +89,7 @@ def build_triple_signals(df: pd.DataFrame):
             cur = 0
         hold_B[i] = cur
 
-    # Mode C (mayoritas): entry saat konfluensi, bertahan selama minimal 2 dari 3 ST masih searah
-    tr_sum = tr1 + tr2 + tr3  # +3/+1 berarti >=2 bullish; -3/-1 berarti >=2 bearish
+    tr_sum = tr1 + tr2 + tr3
     hold_C = np.zeros(len(conf), dtype=int)
     cur = 0
     for i in range(1, len(conf)):
@@ -136,6 +119,7 @@ def load_all(ex):
         t = pd.to_datetime(x["ts"]).astype("int64").to_numpy()
         sig = build_triple_signals(x)
         out[tf] = {
+            "df": x,
             "t": t,
             "step": int(np.median(np.diff(t))),
             "o": x["open"].to_numpy(float),
@@ -148,30 +132,24 @@ def load_all(ex):
 
 
 def align(e, h):
-    """Menyelaraskan sinyal konfluensi TF besar ke TF entry tanpa lookahead bias."""
     idx = np.searchsorted(h["t"] + h["step"], e["t"] + e["step"], side="right") - 1
     h_conf = h["sig"]["conf"]
     return np.where(idx >= 0, h_conf[np.clip(idx, 0, None)], 0)
 
 
 def build_target(conf, hold, ok_mtf, mtf_mode):
-    """Menghitung target posisi (-1, 0, 1) pada setiap bar."""
     if mtf_mode == "none":
         return hold.copy()
     if mtf_mode == "B":
-        # MTF-B: bertahan hanya jika TF entry masih valid DAN seluruh TF filter tetap konfluensi searah
         return np.where(ok_mtf, hold, 0)
 
-    # MTF-A: entry wajib lolos filter MTF saat konfluensi baru terbentuk; exit mengikuti aturan Exit Mode TF entry
     tg = np.zeros(len(hold), dtype=int)
     cur = 0
     for i in range(1, len(hold)):
         if cur != 0:
-            # Cek apakah Exit Mode TF entry sudah meminta keluar atau berbalik arah
             if hold[i] == 0:
                 cur = 0
             elif hold[i] != cur:
-                # Langsung balik arah hanya jika konfluensi baru + filter MTF searah
                 cur = conf[i] if (conf[i] == hold[i] and ok_mtf[i]) else 0
         if cur == 0 and conf[i] != 0 and conf[i] != conf[i - 1]:
             if ok_mtf[i]:
@@ -182,19 +160,23 @@ def build_target(conf, hold, ok_mtf, mtf_mode):
 
 def trades(e, tg, up, dn):
     o, c = e["o"], e["c"]
-    out, pos, ep, rd, je = [], 0, 0.0, 0.0, 0
+    out_stats, out_tv = [], []
+    pos, ep, rd, je = 0, 0.0, 0.0, 0
     for i in range(1, len(c) - 1):
         if tg[i] != tg[i - 1]:
             px = o[i + 1]
             if pos:
-                out.append((je, pos, ep, px, rd, "flip" if tg[i] == -pos else "lepas"))
+                reason = "flip" if tg[i] == -pos else "lepas"
+                out_stats.append((je, pos, ep, px, rd, reason))
+                out_tv.append((je, i + 1, pos, ep, px, rd, reason))
             pos = tg[i]
             if pos:
                 ep, je = px, i + 1
                 rd = max(abs((px - dn[i]) / px) if pos == 1 else abs((up[i] - px) / px), 1e-4)
     if pos:
-        out.append((je, pos, ep, c[-1], rd, "end"))
-    return out
+        out_stats.append((je, pos, ep, c[-1], rd, "end"))
+        out_tv.append((je, len(c) - 1, pos, ep, c[-1], rd, "end"))
+    return out_stats, out_tv
 
 
 def run(ex):
@@ -207,7 +189,7 @@ def run(ex):
     }
 
     for exit_code, exit_desc in exit_labels.items():
-        rows, yrs = [], []
+        rows, yrs, tv_blocks = [], [], []
         for tf in ORDER:
             e = D[tf]
             conf = e["sig"]["conf"]
@@ -226,15 +208,20 @@ def run(ex):
                 for h in st:
                     ok = ok & (align(e, D[h]) == hold)
                 tg = build_target(conf, hold, ok, md)
-                r, y = stats(trades(e, tg, up, dn), e["yr"], tf, nm, e["months"])
+                tr_stats, tr_tv = trades(e, tg, up, dn)
+                r, y = stats(tr_stats, e["yr"], tf, nm, e["months"])
                 if r:
                     rows.append(r)
                     yrs += y
+                    if r["bersihR_total"] > 0:
+                        tv_blocks.append(generate_tv_report(tr_tv, e["df"], tf, f"{exit_code} - {nm}"))
 
         bt._emit(
             f"\n### Triple Supertrend (10-1, 11-2, 12-3) — {exit_desc}\n"
             + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence
         )
+        for blk in tv_blocks:
+            bt._emit(blk)
         bt._emit(
             f"\n### Per tahun ({exit_code} - bersihR)\n"
             + fence + "\n" + pd.DataFrame(yrs).to_string(index=False) + "\n" + fence
