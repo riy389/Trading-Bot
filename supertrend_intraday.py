@@ -1,429 +1,386 @@
-import os
+#!/usr/bin/env python3
+"""
+TRIPLE SUPERTREND INTRADAY & SCALPING (10-1, 11-2, 12-3).
+Pullback Re-Alignment + Hard SL Cap + Fixed TP (1.5R / 2.0R / 2.5R) + Auto-Breakeven di +1.0R.
+Simulasi akun riil: $6 Equity | $3 Initial Margin | Cross Margin | Leverage 5x & 10x.
+"""
 import numpy as np
 import pandas as pd
-import eventtree2 as e2
+
 import backtest as bt
+import eventtree2 as e2
+from zerolag import stats
 from tv_metrics import generate_tv_report
 
-FEE_RT = 0.0022  # 0.12% fee + 0.10% slippage round-trip
+ST_PARAMS = (
+    (10, 1.0),
+    (11, 2.0),
+    (12, 3.0),
+)
 
 
-def calc_rma(arr, period):
-    out = np.full_like(arr, np.nan, dtype=np.float64)
-    if len(arr) < period:
+def rma(series: np.ndarray, length: int) -> np.ndarray:
+    out = np.full(len(series), np.nan, dtype=float)
+    if len(series) < length:
         return out
-    out[period - 1] = np.mean(arr[:period])
-    alpha = 1.0 / period
-    for i in range(period, len(arr)):
-        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
+    out[length - 1] = np.mean(series[:length])
+    alpha = 1.0 / length
+    for i in range(length, len(series)):
+        out[i] = alpha * series[i] + (1.0 - alpha) * out[i - 1]
     return out
 
 
-def calc_ema(arr, period):
-    out = np.full_like(arr, np.nan, dtype=np.float64)
-    if len(arr) < period:
-        return out
-    out[period - 1] = np.mean(arr[:period])
-    alpha = 2.0 / (period + 1.0)
-    for i in range(period, len(arr)):
-        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i - 1]
-    return out
+def calc_adx(df: pd.DataFrame, length: int = 14) -> np.ndarray:
+    h = df["high"].to_numpy(float)
+    l = df["low"].to_numpy(float)
+    c = df["close"].to_numpy(float)
+
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+
+    up_move = h - np.roll(h, 1)
+    dn_move = np.roll(l, 1) - l
+    up_move[0] = 0.0
+    dn_move[0] = 0.0
+
+    plus_dm = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
+
+    atr = rma(tr, length)
+    plus_di = 100.0 * rma(plus_dm, length) / np.maximum(atr, 1e-8)
+    minus_di = 100.0 * rma(minus_dm, length) / np.maximum(atr, 1e-8)
+
+    dx = 100.0 * np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-8)
+    adx = rma(np.nan_to_num(dx, nan=0.0), length)
+    return np.nan_to_num(adx, nan=0.0)
 
 
-def calc_adx(h, l, c, period=14):
+def calc_supertrend(df: pd.DataFrame, atr_len: int, mult: float):
+    h = df["high"].to_numpy(float)
+    l = df["low"].to_numpy(float)
+    c = df["close"].to_numpy(float)
     n = len(c)
-    tr = np.zeros(n, dtype=np.float64)
-    plus_dm = np.zeros(n, dtype=np.float64)
-    minus_dm = np.zeros(n, dtype=np.float64)
-    tr[0] = h[0] - l[0]
-    for i in range(1, n):
-        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
-        up_move = h[i] - h[i - 1]
-        down_move = l[i - 1] - l[i]
-        if up_move > down_move and up_move > 0:
-            plus_dm[i] = up_move
-        if down_move > up_move and down_move > 0:
-            minus_dm[i] = down_move
 
-    atr = calc_rma(tr, period)
-    p_di = 100.0 * calc_rma(plus_dm, period) / np.where(atr == 0, np.nan, atr)
-    m_di = 100.0 * calc_rma(minus_dm, period) / np.where(atr == 0, np.nan, atr)
-    denom = p_di + m_di
-    dx = 100.0 * np.abs(p_di - m_di) / np.where(denom == 0, np.nan, denom)
-    return calc_rma(dx, period)
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
+    tr_raw = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    atr = rma(tr_raw, atr_len)
 
+    hl2 = (h + l) / 2.0
+    basic_ub = hl2 + mult * atr
+    basic_lb = hl2 - mult * atr
 
-def calc_supertrend(h, l, c, atr_len, mult):
-    n = len(c)
-    tr = np.zeros(n, dtype=np.float64)
-    tr[0] = h[0] - l[0]
-    for i in range(1, n):
-        tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
-    atr = calc_rma(tr, atr_len)
-    hl2 = 0.5 * (h + l)
+    ub = np.copy(basic_ub)
+    lb = np.copy(basic_lb)
+    trend = np.zeros(n, dtype=int)
 
-    upper = np.full(n, np.nan, dtype=np.float64)
-    lower = np.full(n, np.nan, dtype=np.float64)
-    trend = np.zeros(n, dtype=np.int8)
+    start = atr_len
+    if start >= n:
+        return ub, lb, trend
 
-    for i in range(atr_len - 1, n):
-        bu = hl2[i] + mult * atr[i]
-        bl = hl2[i] - mult * atr[i]
-        if i == atr_len - 1 or np.isnan(upper[i - 1]):
-            upper[i] = bu
-            lower[i] = bl
-            trend[i] = 1 if c[i] >= hl2[i] else -1
-            continue
+    trend[start] = 1 if c[start] >= hl2[start] else -1
 
-        prev_u = upper[i - 1]
-        prev_l = lower[i - 1]
-        prev_c = c[i - 1]
-        prev_t = trend[i - 1]
+    for i in range(start + 1, n):
+        ub[i] = basic_ub[i] if (basic_ub[i] < ub[i - 1] or c[i - 1] > ub[i - 1]) else ub[i - 1]
+        lb[i] = basic_lb[i] if (basic_lb[i] > lb[i - 1] or c[i - 1] < lb[i - 1]) else lb[i - 1]
 
-        lower[i] = bl if (bl > prev_l or prev_c < prev_l) else prev_l
-        upper[i] = bu if (bu < prev_u or prev_c > prev_u) else prev_u
-
-        if prev_t == -1 and c[i] > prev_u:
-            trend[i] = 1
-        elif prev_t == 1 and c[i] < prev_l:
-            trend[i] = -1
+        if trend[i - 1] == 1:
+            trend[i] = -1 if c[i] < lb[i] else 1
         else:
-            trend[i] = prev_t
+            trend[i] = 1 if c[i] > ub[i] else -1
 
-    return trend, lower, upper
+    return ub, lb, trend
 
 
-def prepare_tf(df):
-    ts = df["timestamp"].to_numpy(dtype=np.int64)
-    o = df["open"].to_numpy(dtype=np.float64)
-    h = df["high"].to_numpy(dtype=np.float64)
-    l = df["low"].to_numpy(dtype=np.float64)
-    c = df["close"].to_numpy(dtype=np.float64)
+def prepare_tf(df: pd.DataFrame):
+    t = pd.to_datetime(df["ts"]).astype("int64").to_numpy()
+    o = df["open"].to_numpy(float)
+    h = df["high"].to_numpy(float)
+    l = df["low"].to_numpy(float)
+    c = df["close"].to_numpy(float)
 
-    t1, lo1, up1 = calc_supertrend(h, l, c, 10, 1.0)
-    t2, lo2, up2 = calc_supertrend(h, l, c, 11, 2.0)
-    t3, lo3, up3 = calc_supertrend(h, l, c, 12, 3.0)
-    adx = calc_adx(h, l, c, 14)
-    ema200 = calc_ema(c, 200)
+    sts = [calc_supertrend(df, length, mult) for length, mult in ST_PARAMS]
+    _, _, tr1 = sts[0]
+    _, _, tr2 = sts[1]
+    ub3, lb3, tr3 = sts[2]
 
-    all_bull = (t1 == 1) & (t2 == 1) & (t3 == 1)
-    all_bear = (t1 == -1) & (t2 == -1) & (t3 == -1)
+    conf = np.where((tr1 == 1) & (tr2 == 1) & (tr3 == 1), 1,
+           np.where((tr1 == -1) & (tr2 == -1) & (tr3 == -1), -1, 0))
 
-    dt = pd.to_datetime(ts, unit="ms", utc=True)
-    yr = dt.year.to_numpy()
-    months = max(1.0, (ts[-1] - ts[0]) / (1000.0 * 86400.0 * 30.4375))
+    adx14 = calc_adx(df, 14)
+    ema200 = pd.Series(c).ewm(span=200, adjust=False).mean().to_numpy(float)
 
     return {
-        "ts": ts, "o": o, "h": h, "l": l, "c": c,
-        "t1": t1, "t2": t2, "t3": t3,
-        "lo3": lo3, "up3": up3,
-        "adx": adx, "ema200": ema200,
-        "all_bull": all_bull, "all_bear": all_bear,
-        "yr": yr, "months": months,
+        "df": df,
+        "t": t,
+        "step": int(np.median(np.diff(t))),
+        "o": o,
+        "h": h,
+        "l": l,
+        "c": c,
+        "tr1": tr1,
+        "tr3": tr3,
+        "conf": conf,
+        "up3": ub3,
+        "dn3": lb3,
+        "adx": adx14,
+        "ema200": ema200,
+        "yr": df["ts"].dt.year.to_numpy(),
+        "months": (df["ts"].iloc[-1] - df["ts"].iloc[0]).days / 30,
     }
 
 
-def align_mtf(exec_ts, exec_step_ms, htf_data, htf_step_ms):
-    n = len(exec_ts)
-    dir_arr = np.zeros(n, dtype=np.int8)
-    ema_ok_short = np.zeros(n, dtype=bool)
-
-    htf_close_ts = htf_data["ts"] + htf_step_ms
-    idx = np.searchsorted(htf_close_ts, exec_ts + exec_step_ms, side="right") - 1
-
+def align_htf(e, h):
+    idx = np.searchsorted(h["t"] + h["step"], e["t"] + e["step"], side="right") - 1
+    clipped = np.clip(idx, 0, None)
     valid = idx >= 0
-    v_idx = idx[valid]
-
-    bull = htf_data["all_bull"][v_idx]
-    bear = htf_data["all_bear"][v_idx]
-    d_sub = np.zeros(len(v_idx), dtype=np.int8)
-    d_sub[bull] = 1
-    d_sub[bear] = -1
-    dir_arr[valid] = d_sub
-
-    c_htf = htf_data["c"][v_idx]
-    e_htf = htf_data["ema200"][v_idx]
-    ema_ok_short[valid] = (~np.isnan(e_htf)) & (c_htf < e_htf)
-
-    return dir_arr, ema_ok_short
+    h_conf = np.where(valid, h["conf"][clipped], 0)
+    h_short_ok = np.where(valid, h["c"][clipped] < h["ema200"][clipped], False)
+    return h_conf, h_short_ok
 
 
-def simulate_trades(e, filt_dir, filt_short_ok, sl_min_pct, sl_max_pct, tp_rr, use_be=True):
+def run_intraday_trades(e, filt_dir, filt_short_ok, sl_min_pct: float, sl_max_pct: float, tp_rr: float):
     o, h, l, c = e["o"], e["h"], e["l"], e["c"]
-    t1, t3 = e["t1"], e["t3"]
-    lo3, up3 = e["lo3"], e["up3"]
+    tr1, tr3 = e["tr1"], e["tr3"]
+    up3, dn3 = e["up3"], e["dn3"]
     adx, ema200 = e["adx"], e["ema200"]
     n = len(c)
 
+    out_stats, out_tv = [], []
     pos = 0
     je = 0
     ep = 0.0
-    sl = 0.0
-    tp = 0.0
-    rd = 0.0
+    sl_px = 0.0
+    tp_px = 0.0
+    rd_pct = 0.0
+    rd_dist = 0.0
     be_moved = False
-    trades = []
 
-    for i in range(205, n - 1):
-        # 1. Kelola posisi aktif di bar i (menggunakan high/low bar i)
+    for i in range(200, n - 1):
+        # 1. Evaluasi posisi terbuka di bar i
         if pos == 1:
-            # Cek SL terlebih dahulu (konservatif bila SL & TP kena di bar yang sama)
-            if l[i] <= sl:
-                px = min(o[i], sl)
+            if l[i] <= sl_px:
+                px = min(o[i], sl_px)
                 reason = "be" if be_moved else "sl"
-                trades.append((je, i, 1, ep, px, rd, reason))
+                out_stats.append((je, 1, ep, px, rd_pct, reason))
+                out_tv.append((je, i, 1, ep, px, rd_pct, reason))
                 pos = 0
-            elif h[i] >= tp:
-                px = max(o[i], tp)
-                trades.append((je, i, 1, ep, px, rd, "tp"))
+            elif h[i] >= tp_px:
+                px = max(o[i], tp_px)
+                out_stats.append((je, 1, ep, px, rd_pct, "tp"))
+                out_tv.append((je, i, 1, ep, px, rd_pct, "tp"))
                 pos = 0
             else:
-                if use_be and (not be_moved) and h[i] >= ep + 1.0 * rd:
-                    sl = ep * 1.0025  # Breakeven +0.25% tutup fee & slippage
+                if (not be_moved) and h[i] >= ep + rd_dist:
+                    sl_px = ep * 1.0025  # Auto-Breakeven +0.25% tutup fee + slippage
                     be_moved = True
-                if t3[i] == -1:
-                    # Garis lambat 12-3 flip berlawanan -> keluar di open i+1
-                    trades.append((je, i + 1, 1, ep, o[i + 1], rd, "flip12"))
+                if tr3[i] == -1:
+                    out_stats.append((je, 1, ep, o[i + 1], rd_pct, "lepas"))
+                    out_tv.append((je, i + 1, 1, ep, o[i + 1], rd_pct, "lepas"))
                     pos = 0
 
         elif pos == -1:
-            if h[i] >= sl:
-                px = max(o[i], sl)
+            if h[i] >= sl_px:
+                px = max(o[i], sl_px)
                 reason = "be" if be_moved else "sl"
-                trades.append((je, i, -1, ep, px, rd, reason))
+                out_stats.append((je, -1, ep, px, rd_pct, reason))
+                out_tv.append((je, i, -1, ep, px, rd_pct, reason))
                 pos = 0
-            elif l[i] <= tp:
-                px = min(o[i], tp)
-                trades.append((je, i, -1, ep, px, rd, "tp"))
+            elif l[i] <= tp_px:
+                px = min(o[i], tp_px)
+                out_stats.append((je, -1, ep, px, rd_pct, "tp"))
+                out_tv.append((je, i, -1, ep, px, rd_pct, "tp"))
                 pos = 0
             else:
-                if use_be and (not be_moved) and l[i] <= ep - 1.0 * rd:
-                    sl = ep * 0.9975  # Breakeven -0.25% tutup fee & slippage
+                if (not be_moved) and l[i] <= ep - rd_dist:
+                    sl_px = ep * 0.9975  # Auto-Breakeven -0.25% tutup fee + slippage
                     be_moved = True
-                if t3[i] == 1:
-                    trades.append((je, i + 1, -1, ep, o[i + 1], rd, "flip12"))
+                if tr3[i] == 1:
+                    out_stats.append((je, -1, ep, o[i + 1], rd_pct, "lepas"))
+                    out_tv.append((je, i + 1, -1, ep, o[i + 1], rd_pct, "lepas"))
                     pos = 0
 
-        # 2. Cari sinyal baru saat flat (evaluasi close bar i -> entry open bar i+1)
-        if pos == 0:
-            if np.isnan(adx[i]) or adx[i] <= 20.0:
-                continue
-
-            # Pullback re-alignment: 12-3 sudah searah tren, 10-1 baru flip kembali searah
+        # 2. Cari sinyal baru saat flat (evaluasi close bar i -> eksekusi open bar i+1)
+        if pos == 0 and adx[i] > 20.0:
             long_sig = (
                 filt_dir[i] == 1
-                and t3[i] == 1
-                and t1[i] == 1
-                and t1[i - 1] == -1
+                and tr3[i] == 1
+                and tr1[i] == 1
+                and tr1[i - 1] == -1
             )
             short_sig = (
                 filt_dir[i] == -1
                 and filt_short_ok[i]
-                and (not np.isnan(ema200[i]))
                 and c[i] < ema200[i]
-                and t3[i] == -1
-                and t1[i] == -1
-                and t1[i - 1] == 1
+                and tr3[i] == -1
+                and tr1[i] == -1
+                and tr1[i - 1] == 1
             )
 
             if long_sig:
                 cand_ep = o[i + 1]
-                cand_sl = lo3[i]
-                cand_rd = cand_ep - cand_sl
-                sl_pct = (cand_rd / cand_ep) * 100.0 if cand_ep > 0 else 0.0
-                if sl_min_pct <= sl_pct <= sl_max_pct:
+                cand_sl = dn3[i]
+                cand_dist = cand_ep - cand_sl
+                cand_rd = cand_dist / cand_ep if cand_ep > 0 else 0.0
+                if sl_min_pct <= cand_rd <= sl_max_pct:
                     pos = 1
                     je = i + 1
                     ep = cand_ep
-                    sl = cand_sl
-                    rd = cand_rd
-                    tp = ep + tp_rr * rd
+                    sl_px = cand_sl
+                    rd_dist = cand_dist
+                    rd_pct = max(cand_rd, 1e-4)
+                    tp_px = ep + tp_rr * rd_dist
                     be_moved = False
 
             elif short_sig:
                 cand_ep = o[i + 1]
                 cand_sl = up3[i]
-                cand_rd = cand_sl - cand_ep
-                sl_pct = (cand_rd / cand_ep) * 100.0 if cand_ep > 0 else 0.0
-                if sl_min_pct <= sl_pct <= sl_max_pct:
+                cand_dist = cand_sl - cand_ep
+                cand_rd = cand_dist / cand_ep if cand_ep > 0 else 0.0
+                if sl_min_pct <= cand_rd <= sl_max_pct:
                     pos = -1
                     je = i + 1
                     ep = cand_ep
-                    sl = cand_sl
-                    rd = cand_rd
-                    tp = ep - tp_rr * rd
+                    sl_px = cand_sl
+                    rd_dist = cand_dist
+                    rd_pct = max(cand_rd, 1e-4)
+                    tp_px = ep - tp_rr * rd_dist
                     be_moved = False
 
     if pos != 0:
-        trades.append((je, n - 1, pos, ep, c[-1], rd, "end"))
+        out_stats.append((je, pos, ep, c[-1], rd_pct, "end"))
+        out_tv.append((je, n - 1, pos, ep, c[-1], rd_pct, "end"))
 
-    return trades
+    return out_stats, out_tv
 
 
-def sim_cross_account(trades, init_eq=6.0, init_margin=3.0, lev=10.0):
+def sim_cross_6usd(tr_stats, lev: float, init_eq: float = 6.0, init_margin: float = 3.0, cost_pct: float = 0.0022):
     """
-    Simulasi Cross Margin:
-    - Seluruh equity menjadi jaminan (collateral).
-    - Ukuran posisi (notional) = min(init_margin, equity * 0.5) * lev.
-    - Likuidasi terjadi jika equity + unrealized_worst <= notional * 0.005 (MMR 0.5%).
+    Simulasi akun Cross Margin:
+      - Modal awal $6.00 (seluruh equity jadi jaminan / collateral).
+      - Initial margin $3.00 (atau 50% equity jika saldo turun di bawah $6).
+      - Notional posisi = margin * leverage (5x = $15, 10x = $30).
+      - Cek likuidasi jika equity + worst_loss <= notional * 0.5% (MMR).
     """
     eq = init_eq
     peak = init_eq
     max_dd = 0.0
-    mc_count = 0
+    is_mc = False
 
-    for tr in trades:
+    for _, pos, ep, px, rd, _ in tr_stats:
         if eq < 1.0:
-            mc_count += 1
-            break
-        margin_used = min(init_margin, eq * 0.5)
-        notional = margin_used * lev
-
-        _, _, pos, ep, px, rd, _ = tr
-        raw_ret = ((px - ep) / ep) if pos == 1 else ((ep - px) / ep)
-
-        # Cek skenario terburuk: posisi menyentuh SL sebelum exit
-        worst_ret = -(rd / ep)
-        worst_pnl = notional * (worst_ret - FEE_RT * 0.5)
-        if eq + worst_pnl <= notional * 0.005:
-            mc_count += 1
+            is_mc = True
             eq = 0.0
             max_dd = 100.0
             break
 
-        pnl = notional * (raw_ret - FEE_RT)
-        eq += pnl
+        margin = min(init_margin, eq * 0.5)
+        notional = margin * lev
+
+        # Cek skenario terburuk menyentuh SL sebelum exit
+        worst_pnl = notional * (-rd - cost_pct * 0.5)
+        if eq + worst_pnl <= notional * 0.005:
+            is_mc = True
+            eq = 0.0
+            max_dd = 100.0
+            break
+
+        gross_ret = ((px - ep) / ep) if pos == 1 else ((ep - px) / ep)
+        net_ret = gross_ret - cost_pct
+        eq += notional * net_ret
+
         if eq <= notional * 0.005:
-            mc_count += 1
+            is_mc = True
             eq = 0.0
             max_dd = 100.0
             break
 
         if eq > peak:
             peak = eq
-        dd = (peak - eq) / peak * 100.0 if peak > 0 else 0.0
+        dd = ((peak - eq) / peak) * 100.0 if peak > 0 else 0.0
         if dd > max_dd:
             max_dd = dd
 
-    return eq, max_dd, mc_count
+    end_str = "MC!" if is_mc else f"${eq:.2f}"
+    return end_str, f"{max_dd:.1f}%"
 
 
-def summarize(trades, e, tf, variant):
-    if not trades:
-        return None
-    kotor_r = []
-    bersih_r = []
-    sl_pcts = []
-    wins = 0
-    exits = {}
+def run(ex):
+    d_raw = {tf: e2.load(ex, tf) for tf in ("5m", "15m", "1h", "4h")}
+    D = {tf: prepare_tf(df) for tf, df in d_raw.items()}
 
-    for je, jx, pos, ep, px, rd, reason in trades:
-        exits[reason] = exits.get(reason, 0) + 1
-        pnl_price = (px - ep) if pos == 1 else (ep - px)
-        kr = pnl_price / rd
-        fee_r = (ep * FEE_RT) / rd
-        br = kr - fee_r
-        kotor_r.append(kr)
-        bersih_r.append(br)
-        sl_pcts.append((rd / ep) * 100.0)
-        if br > 0:
-            wins += 1
-
-    n_tr = len(trades)
-    hit = wins / n_tr * 100.0
-    per_bln = n_tr / e["months"]
-    kr_avg = float(np.mean(kotor_r))
-    br_avg = float(np.mean(bersih_r))
-    br_tot = float(np.sum(bersih_r))
-    sl_avg = float(np.mean(sl_pcts))
-
-    eq5, dd5, mc5 = sim_cross_account(trades, 6.0, 3.0, 5.0)
-    eq10, dd10, mc10 = sim_cross_account(trades, 6.0, 3.0, 10.0)
-
-    exit_str = " ".join(f"{k}:{v}" for k, v in sorted(exits.items(), key=lambda x: -x[1]))
-
-    return {
-        "TF": tf,
-        "varian": variant,
-        "trade": n_tr,
-        "bln": round(per_bln, 1),
-        "hit%": round(hit, 1),
-        "kotorR": round(kr_avg, 3),
-        "bersihR": round(br_avg, 3),
-        "totR": round(br_tot, 1),
-        "SL%": round(sl_avg, 2),
-        "End5x": f"${eq5:.2f}" if mc5 == 0 else "MC!",
-        "DD5x%": round(dd5, 1),
-        "End10x": f"${eq10:.2f}" if mc10 == 0 else "MC!",
-        "DD10x%": round(dd10, 1),
-        "keluar": exit_str,
-        "_trades": trades,
-    }
-
-
-def main():
-    ex = os.environ.get("EXCHANGE", "bitget")
-    tfs = ["5m", "15m", "1h", "4h"]
-    raw = {}
-    prep = {}
-
-    for tf in tfs:
-        df = e2.load(ex, tf)
-        raw[tf] = df
-        prep[tf] = prepare_tf(df)
-
-    step_ms = {
-        "5m": 5 * 60 * 1000,
-        "15m": 15 * 60 * 1000,
-        "1h": 60 * 60 * 1000,
-        "4h": 4 * 60 * 60 * 1000,
-    }
-
-    # Bangun filter MTF
-    f_5m_15m, s_5m_15m = align_mtf(prep["5m"]["ts"], step_ms["5m"], prep["15m"], step_ms["15m"])
-    f_5m_1h, s_5m_1h = align_mtf(prep["5m"]["ts"], step_ms["5m"], prep["1h"], step_ms["1h"])
-
+    f_5m_15m, s_5m_15m = align_htf(D["5m"], D["15m"])
+    f_5m_1h, s_5m_1h = align_htf(D["5m"], D["1h"])
     f_5m_both = np.where((f_5m_15m == f_5m_1h) & (f_5m_15m != 0), f_5m_15m, 0)
     s_5m_both = s_5m_15m & s_5m_1h
 
-    f_15m_1h, s_15m_1h = align_mtf(prep["15m"]["ts"], step_ms["15m"], prep["1h"], step_ms["1h"])
-    f_15m_4h, s_15m_4h = align_mtf(prep["15m"]["ts"], step_ms["15m"], prep["4h"], step_ms["4h"])
+    f_15m_1h, s_15m_1h = align_htf(D["15m"], D["1h"])
+    f_15m_4h, s_15m_4h = align_htf(D["15m"], D["4h"])
     f_15m_both = np.where((f_15m_1h == f_15m_4h) & (f_15m_1h != 0), f_15m_1h, 0)
     s_15m_both = s_15m_1h & s_15m_4h
 
-    f_1h_4h, s_1h_4h = align_mtf(prep["1h"]["ts"], step_ms["1h"], prep["4h"], step_ms["4h"])
+    f_1h_4h, s_1h_4h = align_htf(D["1h"], D["4h"])
 
-    configs = [
-        # (exec_tf, label, f_dir, f_short, sl_min, sl_max)
-        ("5m", "F:15m", f_5m_15m, s_5m_15m, 0.50, 1.50),
-        ("5m", "F:1h", f_5m_1h, s_5m_1h, 0.50, 1.50),
-        ("5m", "F:15m+1h", f_5m_both, s_5m_both, 0.50, 1.50),
-        ("15m", "F:1h", f_15m_1h, s_15m_1h, 0.70, 2.00),
-        ("15m", "F:4h", f_15m_4h, s_15m_4h, 0.70, 2.00),
-        ("15m", "F:1h+4h", f_15m_both, s_15m_both, 0.70, 2.00),
-        ("1h", "F:4h", f_1h_4h, s_1h_4h, 0.80, 2.50),
+    setups = [
+        ("5m", "F:15m", f_5m_15m, s_5m_15m, 0.0050, 0.0150),
+        ("5m", "F:1h", f_5m_1h, s_5m_1h, 0.0050, 0.0150),
+        ("5m", "F:15m+1h", f_5m_both, s_5m_both, 0.0050, 0.0150),
+        ("15m", "F:1h", f_15m_1h, s_15m_1h, 0.0070, 0.0200),
+        ("15m", "F:4h", f_15m_4h, s_15m_4h, 0.0070, 0.0200),
+        ("15m", "F:1h+4h", f_15m_both, s_15m_both, 0.0070, 0.0200),
+        ("1h", "F:4h", f_1h_4h, s_1h_4h, 0.0080, 0.0250),
     ]
 
-    tp_list = [1.5, 2.0, 2.5]
-    rows = []
+    rows, sim_rows, yrs, tv_candidates = [], [], [], []
+    for tf, flabel, fd, fs, smin, smax in setups:
+        e = D[tf]
+        for tp_rr in (1.5, 2.0, 2.5):
+            label = f"{flabel} | TP:{tp_rr}R+BE"
+            tr_stats, tr_tv = run_intraday_trades(e, fd, fs, smin, smax, tp_rr)
+            r, y = stats(tr_stats, e["yr"], tf, label, e["months"])
+            if r:
+                rows.append(r)
+                yrs += y
+                end5, dd5 = sim_cross_6usd(tr_stats, 5.0)
+                end10, dd10 = sim_cross_6usd(tr_stats, 10.0)
+                sim_rows.append({
+                    "TF": tf,
+                    "varian": label,
+                    "trade": r["trade"],
+                    "hit%": r["hit%"],
+                    "bersihR": r["bersihR_total"],
+                    "SL%": r["jarak_SL%"],
+                    "End_5x": end5,
+                    "MaxDD_5x": dd5,
+                    "End_10x": end10,
+                    "MaxDD_10x": dd10,
+                })
+                if r["bersihR_total"] > 0:
+                    tv_candidates.append((r["bersihR_total"], tr_tv, e["df"], tf, label))
 
-    for exec_tf, lbl, fd, fs, smin, smax in configs:
-        for tp_rr in tp_list:
-            vname = f"{lbl} | TP:{tp_rr}R+BE"
-            tr = simulate_trades(prep[exec_tf], fd, fs, smin, smax, tp_rr, use_be=True)
-            res = summarize(tr, prep[exec_tf], exec_tf, vname)
-            if res:
-                rows.append(res)
+    fence = "`" * 3
+    bt._emit(
+        "\n### Triple Supertrend Intraday & 5m Scalping (Pullback Re-Alignment + SL Cap + Fixed TP + BE)\n"
+        + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence
+    )
+    bt._emit(
+        "\n### Simulasi Akun Riil: $6 Equity | $3 Initial Margin | Cross Margin | Lev 5x vs 10x\n"
+        + fence + "\n" + pd.DataFrame(sim_rows).to_string(index=False) + "\n" + fence
+    )
+    for _, tr_tv, df_raw, tf, label in sorted(tv_candidates, key=lambda x: x[0], reverse=True)[:4]:
+        bt._emit(generate_tv_report(tr_tv, df_raw, tf, label))
+    bt._emit(
+        "\n### Per tahun (Intraday - bersihR)\n"
+        + fence + "\n" + pd.DataFrame(yrs).to_string(index=False) + "\n" + fence
+    )
 
-    bt._emit("### Intraday & Scalping Pullback Triple Supertrend ($6 Cross Margin | $3 Initial Margin | 5x & 10x)\n")
-    df_out = pd.DataFrame([{k: v for k, v in r.items() if k != "_trades"} for r in rows])
-    bt._emit(df_out.to_markdown(index=False))
-    bt._emit("\n")
 
-    # Cetak detail TradingView report untuk top 3 varian dengan totR tertinggi (jika positif)
-    top_rows = sorted([r for r in rows if r["totR"] > 0], key=lambda x: x["totR"], reverse=True)[:3]
-    for r in top_rows:
-        bt._emit(generate_tv_report(r["_trades"], raw[r["TF"]], r["TF"], r["varian"]))
+def main():
+    import ccxt
+    ex = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    ex.load_markets()
+    run(ex)
 
 
 if __name__ == "__main__":
