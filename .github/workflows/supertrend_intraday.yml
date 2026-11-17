@@ -1,0 +1,36 @@
+name: Run Supertrend Intraday ($6 Cross)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest-intraday:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip & market data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            data
+          key: ${{ runner.os }}-intraday-st-v1
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas numpy tabulate ccxt
+
+      - name: Run Intraday Backtest
+        env:
+          EXCHANGE: bitget
+        run: |
+          python supertrend_intraday.py
