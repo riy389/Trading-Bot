@@ -1,0 +1,30 @@
+name: Run Combo DC ATR Fresh
+
+on:
+  workflow_dispatch:
+
+jobs:
+  combo_dc_atr_fresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ccxt pandas numpy scikit-learn
+
+      - name: Cache candles
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+
+      - name: Run combo_dc_atr_fresh
+        run: python3 combo_dc_atr_fresh.py
