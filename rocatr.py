@@ -15,7 +15,7 @@ import eventtree2 as e2
 FEE, SLIP, K, WARM, EMA_N, ATR_N = 0.0012, 0.0010, 2.0, 200, 50, 14
 VARIANTS = [
     ("BASE ROC10 m0.8 EMA50", {}),
-    ("ROC 8", {"roc": 8}), ("ROC 12", {"roc": 12}),
+    ("ROC 8", {"roc_n": 8}), ("ROC 12", {"roc_n": 12}),
     ("m 0.6", {"m": 0.6}), ("m 1.0", {"m": 1.0}),
     ("tanpa filter ATR", {"m": 0.0}), ("tanpa filter EMA", {"ema": False}),
     ("long saja", {"sides": (1,)}), ("short saja", {"sides": (-1,)}),
