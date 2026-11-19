@@ -1,0 +1,22 @@
+name: Run Reader
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reader:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ccxt pandas numpy
+      - name: Cache candles
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+      - run: python3 reader.py
