@@ -1,0 +1,31 @@
+name: Run Kronos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  kronos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: git clone --depth 1 https://github.com/shiyu-coder/Kronos Kronos
+      - run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install ccxt scikit-learn "pandas==2.2.2" "numpy<2.3" einops==0.8.1 huggingface_hub==0.33.1 safetensors==0.6.2 tqdm matplotlib
+      - name: Cache candles
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+      - run: python3 kronos_test.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kronos-preds
+          path: kronos_preds.csv
+          if-no-files-found: ignore
