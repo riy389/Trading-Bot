@@ -1,0 +1,23 @@
+name: Run DerivData
+
+on:
+  workflow_dispatch:
+
+jobs:
+  derivdata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ccxt pandas numpy scikit-learn
+
+      - name: Run derivdata
+        run: python3 derivdata.py
