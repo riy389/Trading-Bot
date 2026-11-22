@@ -83,7 +83,7 @@ def run(ex):
     thr = atr.shift(1).rolling(WIN, min_periods=1000).quantile(2 / 3)
     lsr = F["ls_acct"] - F["ls_acct"].rolling(WIN, min_periods=1000).mean()
     tk = F["taker_delta_24h"]
-    ok = (atr.notna() & thr.notna() & lsr.notna() & tk.notna()).to_numpy()
+    ok = (atr.notna() & thr.notna() & lsr.notna() & tk.notna()).to_numpy(copy=True)
     ok[:et.WARM] = False
     volok = (atr > thr).to_numpy() & ok
     dL, dT = np.where(lsr.to_numpy() < 0, 1, -1), np.where(tk.to_numpy() > 0, 1, -1)
