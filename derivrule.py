@@ -18,8 +18,10 @@ import backtest as bt
 import eventtree as et
 import eventtree2 as e2
 import derivtree as dt
+import gates
 
 COST, TF, WIN = 0.0022, "15m", 2880
+N_TRIED = 12  # naikkan tiap ada varian/ide baru, jangan reset
 
 
 def sim(o, h, l, c, sig, rf, maxb):
@@ -99,7 +101,8 @@ def run(ex):
             sig = dirs[d] * ((volok if vf else ok).astype(int))
             tr = sim(o, h, l, c, sig, rfs[mode], mb)
             s, g, net, st = stats(tr, ts, half)
-            rows.append({"varian": nm, **st})
+            gt = gates.run_gates(g, g - net, N_TRIED)
+            rows.append({"varian": nm, **st, "p_IS": gt["p_IS"], "p_OOS": gt["p_OOS"], "gate": "LOLOS" if gt["LOLOS"] else "GUGUR"})
             if nm in (f"{mode} LT",):
                 y = ts.dt.year.to_numpy()[s.astype(int)]
                 for v in np.unique(y):
