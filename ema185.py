@@ -4,11 +4,13 @@ UJI EMA185 4h (Binance, candle 4h dari cache 1h, sebelum holdout 2026-05-01). At
 BUY : candle hijau open < EMA185 dan close > EMA185 = candle 1; close candle 2,3,4 semuanya > EMA185; entry open candle 5.
 SELL: candle merah open > EMA185 dan close < EMA185 = candle 1; entry langsung open candle 2 (tanpa konfirmasi).
 SL = swing pivot 5 terakhir sebelum entry (long: swing low di bawah entry, short: swing high di atas entry), skip kalau jarak > 8%.
-Exit 4 varian: TP 1.5R, TP 2R, TP 3R, atau EMAexit (tanpa TP, keluar di open berikutnya setelah close 4h menembus EMA185 melawan posisi).
+Exit (semua varian): SL, TP (1.5R/2R/3R/tanpa TP), atau close 4h menembus EMA185 melawan posisi (exit di open berikutnya), mana yang kena duluan.
+Candle cross yang menutup posisi tetap dibaca sebagai sinyal baru (cross merah -> SELL di open berikutnya; cross hijau -> hitung 4 candle).
+Varian "noWE": tanpa entry baru kalau open candle entry jatuh Sabtu/Minggu UTC (posisi terbuka tidak ditutup, sinyal dilewati).
 SL/TP dicek intrabar (gap fill di open); kalau SL dan TP kena di candle 4h yang sama, urutan dibaca dari candle 1h (sama di 1h = SL dulu).
-Satu posisi per koin, sinyal lain diabaikan saat posisi terbuka, tanpa balik arah. R = jarak entry ke SL.
+Satu posisi per koin. R = jarak entry ke SL.
 Biaya 0,22% per trade (dalam R = 0,22% / jarak SL) + funding nyata. 13 koin selain BTC = satu portofolio, BTC referensi.
-Gate: N_TRIED = 33 (29 + 4 varian), per varian.
+Gate: N_TRIED = 37 (29 + 8 varian), per varian.
 LULUS (dikunci sebelum lihat hasil): gate LOLOS, PF net IS dan OOS >= 1,2, net/trade IS dan OOS > 0, >= 30 trade per paruh.
 """
 from datetime import datetime, timedelta, timezone
@@ -23,9 +25,12 @@ import utswing4h as u
 from datacoins import SYMS
 from derivrule1h import COST
 
-N_TRIED, WARM, EMA_N, WAIT, PIV, MAXSL = 33, 200, 185, 3, 5, 0.08
+N_TRIED, WARM, EMA_N, WAIT, PIV, MAXSL = 37, 200, 185, 3, 5, 0.08
 H4 = u.H4
-VAR = {"TP1.5R": 1.5, "TP2R": 2.0, "TP3R": 3.0, "EMAexit": None}
+VAR = {}
+for _wk in (False, True):
+    for _nm, _m in (("TP1.5R+EMA", 1.5), ("TP2R+EMA", 2.0), ("TP3R+EMA", 3.0), ("EMAexit", None)):
+        VAR[_nm + (" noWE" if _wk else "")] = (_m, _wk)
 
 
 def swing(flag, val, s, e, d):
@@ -47,9 +52,10 @@ def first(k1, t, d, sl, tp):
     return "sl"
 
 
-def trades(name, k4, k1, f, m):
+def trades(name, k4, k1, f, m, wk):
     o, h, l, c = (k4[x].to_numpy(dtype=float) for x in ("open", "high", "low", "close"))
     ts = k4.index.to_numpy().astype("datetime64[ns]")
+    dow = (ts.astype("datetime64[D]").astype("int64") + 3) % 7
     ema = k4["close"].ewm(span=EMA_N, adjust=False).mean().to_numpy()
     n = len(c)
     up = (c > o) & (o < ema) & (c > ema)
@@ -63,7 +69,7 @@ def trades(name, k4, k1, f, m):
             d, s = 1, i + WAIT + 1
         elif dn[i]:
             d, s = -1, i + 1
-        if d == 0:
+        if d == 0 or (wk and dow[s] >= 5):
             i += 1
             continue
         e = o[s]
@@ -89,9 +95,8 @@ def trades(name, k4, k1, f, m):
             if hp:
                 x, tx = tp, ts[q] + H4
                 break
-            if tp is None and q + 1 < n and ((d > 0 and c[q] < ema[q]) or (d < 0 and c[q] > ema[q])):
+            if q + 1 < n and ((d > 0 and c[q] < ema[q]) or (d < 0 and c[q] > ema[q])):
                 x, tx = o[q + 1], ts[q + 1]
-                q += 1
                 break
             q += 1
         if x is None:
@@ -118,7 +123,7 @@ def main():
         k1 = k[k.index < u.HOLDOUT]
         K[s] = (u.to4h(k), (k1.index.to_numpy().astype("datetime64[ns]"), k1["high"].to_numpy(float), k1["low"].to_numpy(float)), f)
     core = [s for s in SYMS if s != "BTC"]
-    R = {v: {s: trades(s, K[s][0], K[s][1], K[s][2], m) for s in SYMS} for v, m in VAR.items()}
+    R = {v: {s: trades(s, K[s][0], K[s][1], K[s][2], m, wk) for s in SYMS} for v, (m, wk) in VAR.items()}
     P = {v: pd.concat([R[v][s] for s in core]).sort_values("t", kind="stable").reset_index(drop=True) for v in VAR}
     rows = []
     for v, T in P.items():
@@ -136,10 +141,11 @@ def main():
             mk = T["side"] == sd
             ls.append({"exit": v, "sisi": nm, "trade": int(mk.sum()), "gross/tr": round(T.loc[mk, "g"].mean(), 3),
                        "net/tr": round(nt[mk].mean(), 3), "net_R": round(nt[mk].sum(), 1)})
+    base = [v for v, (m, wk) in VAR.items() if not wk]
     pk = []
     for s in SYMS:
         row = {"koin": s + (" (ref)" if s == "BTC" else "")}
-        for v in VAR:
+        for v in base:
             t = R[v][s]
             row[v] = round(float((t["g"] - t["fee"] - t["fund"]).mean()), 3) if len(t) else float("nan")
         pk.append(row)
@@ -147,7 +153,7 @@ def main():
     bt._emit(f"\n### EMA185 4h (Binance, sebelum {u.HOLDOUT}, N_TRIED={N_TRIED}). Biaya 0,22% + funding nyata. 13 koin satu portofolio\n"
              + f3 + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + f3)
     bt._emit("\n### Long vs short per varian\n" + f3 + "\n" + pd.DataFrame(ls).to_string(index=False) + "\n" + f3)
-    bt._emit("\n### Net/trade per koin (BTC = referensi)\n" + f3 + "\n" + pd.DataFrame(pk).to_string(index=False) + "\n" + f3)
+    bt._emit("\n### Net/trade per koin, varian tanpa weekend-block (BTC = referensi)\n" + f3 + "\n" + pd.DataFrame(pk).to_string(index=False) + "\n" + f3)
 
 
 if __name__ == "__main__":
