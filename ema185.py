@@ -10,7 +10,7 @@ Varian "noWE": tanpa entry baru kalau open candle entry jatuh Sabtu/Minggu UTC (
 SL/TP dicek intrabar (gap fill di open); kalau SL dan TP kena di candle 4h yang sama, urutan dibaca dari candle 1h (sama di 1h = SL dulu).
 Satu posisi per koin. R = jarak entry ke SL.
 Biaya 0,22% per trade (dalam R = 0,22% / jarak SL) + funding nyata. 13 koin selain BTC = satu portofolio, BTC referensi.
-Gate: N_TRIED = 37 (29 + 8 varian), per varian.
+Gate: N_TRIED = 38 (29 + 8 varian + EMAexit long), per varian.
 LULUS (dikunci sebelum lihat hasil): gate LOLOS, PF net IS dan OOS >= 1,2, net/trade IS dan OOS > 0, >= 30 trade per paruh.
 """
 from datetime import datetime, timedelta, timezone
@@ -25,12 +25,13 @@ import utswing4h as u
 from datacoins import SYMS
 from derivrule1h import COST
 
-N_TRIED, WARM, EMA_N, WAIT, PIV, MAXSL = 37, 200, 185, 3, 5, 0.08
+N_TRIED, WARM, EMA_N, WAIT, PIV, MAXSL = 38, 200, 185, 3, 5, 0.08
 H4 = u.H4
 VAR = {}
 for _wk in (False, True):
     for _nm, _m in (("TP1.5R+EMA", 1.5), ("TP2R+EMA", 2.0), ("TP3R+EMA", 3.0), ("EMAexit", None)):
         VAR[_nm + (" noWE" if _wk else "")] = (_m, _wk)
+VAR["EMAexit long"] = (None, False)  # long-only: sinyal SELL diabaikan
 
 
 def swing(flag, val, s, e, d):
@@ -52,7 +53,7 @@ def first(k1, t, d, sl, tp):
     return "sl"
 
 
-def trades(name, k4, k1, f, m, wk):
+def trades(name, k4, k1, f, m, wk, lo=False):
     o, h, l, c = (k4[x].to_numpy(dtype=float) for x in ("open", "high", "low", "close"))
     ts = k4.index.to_numpy().astype("datetime64[ns]")
     dow = (ts.astype("datetime64[D]").astype("int64") + 3) % 7
@@ -67,7 +68,7 @@ def trades(name, k4, k1, f, m, wk):
         d, s = 0, 0
         if up[i] and i + WAIT + 1 < n and (c[i + 1:i + WAIT + 1] > ema[i + 1:i + WAIT + 1]).all():
             d, s = 1, i + WAIT + 1
-        elif dn[i]:
+        elif dn[i] and not lo:
             d, s = -1, i + 1
         if d == 0 or (wk and dow[s] >= 5):
             i += 1
@@ -123,7 +124,7 @@ def main():
         k1 = k[k.index < u.HOLDOUT]
         K[s] = (u.to4h(k), (k1.index.to_numpy().astype("datetime64[ns]"), k1["high"].to_numpy(float), k1["low"].to_numpy(float)), f)
     core = [s for s in SYMS if s != "BTC"]
-    R = {v: {s: trades(s, K[s][0], K[s][1], K[s][2], m, wk) for s in SYMS} for v, (m, wk) in VAR.items()}
+    R = {v: {s: trades(s, K[s][0], K[s][1], K[s][2], m, wk, v.endswith(" long")) for s in SYMS} for v, (m, wk) in VAR.items()}
     P = {v: pd.concat([R[v][s] for s in core]).sort_values("t", kind="stable").reset_index(drop=True) for v in VAR}
     rows = []
     for v, T in P.items():
