@@ -279,7 +279,7 @@ def apply_costs(trades, cost):
 
 def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=None, bias=None,
                 be_cost=BE_COST, lock=None, close_end=False, sl_fixed=None, tp_r=TP_R, reverse=True,
-                cooldown=None):
+                cooldown=None, xit=None):
     """Sinyal di close candle i-1 dieksekusi di open candle i.
     Exit hanya lewat: SL tetap (entry -/+ nloss sinyal, 1R) atau trailing TP (garis UT candle
     sebelumnya), keduanya dicek intrabar (low/high); gap -> fill di open. Sinyal berlawanan
@@ -295,6 +295,11 @@ def simulate_ut(df, ut, session, allow_short, trail_on=True, tp_on=False, be_r=N
         # 1) tutup paksa akhir sesi
         if pos is not None and session == "24h" and (day[i] > pos["day"] or tod[i] >= SESSION_CLOSE_MIN):
             trades.append(_close(pos, tss[i], o[i], "session_end"))
+            pos = None
+
+        # 1b) exit-only (xit): sinyal exit di close candle sebelumnya, tutup di open candle ini (tanpa buka arah baru)
+        if pos is not None and xit is not None and xit[i - 1] == (-1 if pos["side"] == "long" else 1):
+            trades.append(_close(pos, tss[i], o[i], "ema_exit"))
             pos = None
 
         # 2) eksekusi sinyal candle sebelumnya di open candle ini
@@ -1483,6 +1488,112 @@ def run_sanity(exchange):
           + fence + "\n" + pd.DataFrame([r1, r2, r3]).to_string(index=False) + "\n" + fence)
 
 
+# ---------- EMA185 4h (aturan Riyanto): mesin backtest.py, data Bitget, funding nyata, 12 pair pooled ----------
+E185_RUN = True              # True: main() hanya menjalankan tes EMA185 4h lalu selesai
+E185_HOLD = pd.Timestamp("2026-05-01", tz="UTC")   # data mulai tanggal ini tidak disentuh (holdout, sama dengan utswing4h)
+E185_N, E185_WARM, E185_PIV, E185_MAXSL, E185_NTRIED = 185, 200, 5, 0.08, 37
+# nama, TP (kelipatan R, None = tanpa TP). Semua varian: SL swing, TP, atau close 4h menembus EMA185 melawan posisi (exit di open berikutnya)
+E185_EXITS = [("TP1.5R+EMA", 1.5), ("TP2R+EMA", 2.0), ("TP3R+EMA", 3.0), ("EMAexit", None)]
+
+
+def e185_swing(flag, val, s, e, d):
+    lo = max(0, s - 100 - E185_PIV - 1)
+    for j in (np.flatnonzero(flag[lo:s - E185_PIV]) + lo)[::-1]:
+        if (val[j] < e) if d > 0 else (val[j] > e):
+            return val[j]
+    return None
+
+
+def e185_arrays(df, wk):
+    """Sinyal di close candle k, order di open candle k+1 (mesin simulate_ut).
+    BUY: candle hijau open < EMA dan close > EMA = candle 1; close candle 2-4 > EMA; sinyal di close candle 4.
+    SELL: candle merah open > EMA dan close < EMA; sinyal di close candle itu (order di open berikutnya).
+    stop = level SL (swing pivot 5 terakhir di sisi yang benar), nloss = jarak open entry ke SL (nan kalau tidak ada / > 8%).
+    xit: -1 = close di bawah EMA (tutup long), +1 = close di atas EMA (tutup short). wk: blok sinyal kalau candle entry Sabtu/Minggu UTC."""
+    o, h, l, c = (df[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close"))
+    n = len(c)
+    ema = df["close"].ewm(span=E185_N, adjust=False).mean().to_numpy()
+    up = (c > o) & (o < ema) & (c > ema)
+    dn = (c < o) & (o > ema) & (c < ema)
+    above = c > ema
+    buy = np.zeros(n, bool)
+    buy[3:] = up[:-3] & above[1:-2] & above[2:-1] & above[3:]
+    sell = dn.copy()
+    buy[:E185_WARM] = sell[:E185_WARM] = False
+    buy[-1] = sell[-1] = False
+    if wk:
+        dow = df["ts"].dt.dayofweek.to_numpy()
+        blk = np.r_[dow[1:] >= 5, False]
+        buy &= ~blk
+        sell &= ~blk
+    pl = pd.Series(l).rolling(2 * E185_PIV + 1, center=True).min().to_numpy() == l
+    ph = pd.Series(h).rolling(2 * E185_PIV + 1, center=True).max().to_numpy() == h
+    stop = np.full(n, np.nan)
+    nloss = np.full(n, np.nan)
+    for k in np.flatnonzero(buy | sell):
+        d = 1 if buy[k] else -1
+        e = o[k + 1]
+        lvl = e185_swing(pl if d > 0 else ph, l if d > 0 else h, k + 1, e, d)
+        if lvl is not None and abs(e - lvl) / e <= E185_MAXSL:
+            stop[k], nloss[k] = lvl, abs(e - lvl)
+    xit = np.where(c < ema, -1, np.where(c > ema, 1, 0))
+    xit[:E185_WARM] = 0
+    return (stop, buy, sell, nloss), xit
+
+
+def run_e185(exchange):
+    import gates
+    per = {nm + sfx: [] for sfx in ("", " noWE") for nm, _ in E185_EXITS}
+    for symbol in PAIRS:
+        print(f"\n=== EMA185 {symbol} 4h ===")
+        df = fetch_ohlcv_cached(exchange, symbol, "4h", DAYS_BACK_TF["4h"])
+        if df is None or len(df) <= E185_WARM or any(g[2] > MAX_GAP_CANDLES for g in find_ohlcv_gaps(df, "4h")):
+            print(f"  [!] Data 4h {symbol} tidak layak, skip.")
+            continue
+        df = df[df["ts"] < E185_HOLD].reset_index(drop=True)
+        f_ts, f_rate = fetch_funding(exchange, symbol, DAYS_BACK_TF["4h"])
+        split_ts = df["ts"].iloc[0] + (df["ts"].iloc[-1] - df["ts"].iloc[0]) / 2
+        cost = net_cost(symbol)
+        for wk in (False, True):
+            ut, xit = e185_arrays(df, wk)
+            for nm, m in E185_EXITS:
+                trades = simulate_ut(df, ut, "free", True, trail_on=False, tp_on=m is not None, be_cost=cost,
+                                     close_end=True, tp_r=m or TP_R, reverse=True, xit=xit)
+                costed = apply_costs(trades, cost)
+                attach_funding(costed, f_ts, f_rate)
+                for t in costed:
+                    t["symbol"] = symbol
+                    t["half"] = "IS" if t["entry_ts"] < str(split_ts) else "OOS"
+                per[nm + (" noWE" if wk else "")] += costed
+                print(f"  {nm}{' noWE' if wk else ''}: {len(costed)} trade")
+    rows, ls = [], []
+    for v, trs in per.items():
+        if not trs:
+            continue
+        r = sw_row(v, trs)
+        d = pd.DataFrame(trs).sort_values("entry_ts", kind="stable")
+        gt = gates.run_gates((d["gross_R"] - d["fund_R"]).to_numpy(), d["fee_R"].to_numpy(), E185_NTRIED)
+        ok = (gt["LOLOS"] and all(r[k] is not None for k in ("pf_IS", "pf_OOS", "netR_IS", "netR_OOS"))
+              and r["pf_IS"] >= SW_PF and r["pf_OOS"] >= SW_PF and r["netR_IS"] > 0 and r["netR_OOS"] > 0
+              and min(r["n_IS"], r["n_OOS"]) >= SW_N)
+        rows.append({"exit": v, **{k: x for k, x in r.items() if k != "A"}, "p_IS": gt["p_IS"], "p_OOS": gt["p_OOS"],
+                     "fold": gt["fold_pos"], "gate": "LOLOS" if gt["LOLOS"] else "GUGUR", "VONIS": "LULUS" if ok else "GUGUR"})
+        for sd in ("long", "short"):
+            g = d[d["side"] == sd]
+            ls.append({"exit": v, "sisi": sd, "trade": len(g), "gross/tr": round(float(g["gross_R"].mean()), 3),
+                       "net/tr": round(float(g["net_R_f"].mean()), 3), "net_R": round(float(g["net_R_f"].sum()), 1)})
+    base = [nm for nm, _ in E185_EXITS if per[nm]]
+    pk = pd.DataFrame({v: pd.DataFrame(per[v]).groupby("symbol")["net_R_f"].mean().round(3) for v in base})
+    pk = pk.reset_index().rename(columns={"symbol": "koin"})
+    fence = "`" * 3
+    _emit("\n### EMA185 4h, mesin backtest.py (Bitget, sebelum " + f"{E185_HOLD.date()}, N_TRIED={E185_NTRIED}"
+          + "), net setelah funding, 12 pair pooled. netR_nofund = sebelum funding, cov% = trade yang tercakup data funding, "
+          + f"pairs_pos = pair dengan netR_full > 0. VONIS = gate LOLOS dan PF IS/OOS >= {SW_PF}, netR > 0 per paruh, n >= {SW_N} per paruh\n"
+          + fence + "\n" + pd.DataFrame(rows).to_string(index=False) + "\n" + fence)
+    _emit("\n### Long vs short per varian (net setelah funding)\n" + fence + "\n" + pd.DataFrame(ls).to_string(index=False) + "\n" + fence)
+    _emit("\n### Net/trade per pair, varian tanpa weekend-block\n" + fence + "\n" + pk.to_string(index=False) + "\n" + fence)
+
+
 def split_by_period(trades, split_ts):
     """Pisahkan trade jadi IS (entry sebelum split_ts) dan OOS (entry sesudahnya)."""
     split = str(split_ts)
@@ -1493,6 +1604,9 @@ def split_by_period(trades, split_ts):
 def main():
     exchange = ccxt.bitget({"enableRateLimit": True, "options": {"defaultType": "swap"}})
     exchange.load_markets()
+    if E185_RUN:
+        run_e185(exchange)
+        return
     if SAN_RUN:
         run_sanity(exchange)
         return
